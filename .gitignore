@@ -1,0 +1,17 @@
+node_modules/
+token.json
+client_secret.json
+uploaded.json
+history.json
+progress.json
+_winctl.ps1
+_launch_ui.*
+_ui_launch.*
+*.log
+*.pyc
+
+# Legacy Python files
+*.py
+start_hidden.vbs
+start_uploader.*
+task.xml
