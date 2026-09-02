@@ -247,14 +247,21 @@ function toast(title, message, url) {
 // ---------------------------------------------------------------------------
 // Screen renderer — writes whole frames in one go, no clear(): no flicker
 // ---------------------------------------------------------------------------
-const C = { reset: '\x1b[0m', bold: '\x1b[1m', dim: '\x1b[90m', cyan: '\x1b[36m', green: '\x1b[32m', yellow: '\x1b[33m', red: '\x1b[31m', underline: '\x1b[4m' };
+const C = { reset: '\x1b[0m', bold: '\x1b[1m', dim: '\x1b[90m', cyan: '\x1b[36m', green: '\x1b[32m', brightGreen: '\x1b[92m', yellow: '\x1b[33m', red: '\x1b[31m', underline: '\x1b[4m', inv: '\x1b[7m', noinv: '\x1b[27m' };
 const W = 68;
 const out = process.stdout;
 const vis = s => s.replace(/\x1b\[[0-9;]*m/g, '').length;
 const clip = (s, n) => (vis(s) <= n ? s : s.slice(0, Math.max(0, n - 1)) + '…');
 const lr = (left, right) => { const gap = W - vis(left) - vis(right); return left + ' '.repeat(Math.max(1, gap)) + right; };
-const key = (k, label) => `${C.dim}[${C.reset}${C.bold}${k}${C.reset}${C.dim}]${C.reset} ${label}`;
-const keys = (...pairs) => '  ' + pairs.map(([k, l]) => key(k, l)).join('   ');
+const cap = k => `${C.inv} ${k} ${C.noinv}`;                        // key cap: inverse-video " C "
+const key = (k, label) => `${cap(k)} ${label}`;
+const keys = (...pairs) => '  ' + pairs.map(([k, l]) => key(k, l)).join('  ');
+const rule = label => `  ${C.dim}── ${label} ${'─'.repeat(Math.max(0, W - 6 - label.length))}${C.reset}`;
+const plural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
+const shortPath = p => (p.toLowerCase().startsWith(os.homedir().toLowerCase()) ? '~' + p.slice(os.homedir().length) : p);
+const link = url => `${C.cyan}${C.underline}${url.replace(/^https?:\/\//, '')}${C.reset}`;
+const SPARK = '▁▂▃▄▅▆▇█';
+const sparkline = (vals) => { const max = Math.max(1, ...vals); return vals.map(v => SPARK[Math.min(7, Math.floor((v / max) * 7.99))]).join(''); };
 
 function enterScreen() { out.write('\x1b[?1049h\x1b[?25l'); }
 function leaveScreen() { out.write('\x1b[?25h\x1b[?1049l'); }
@@ -312,6 +319,10 @@ const SWEEP_ROW0 = 7;        // header(): row 1 blank, rows 2–6 GAME, rows 7�
 let lastActivity = Date.now();
 const touch = () => { lastActivity = Date.now(); };
 function sweepTick() {
+  if (S.view === 'uploading' && S.current && S.current.sizeMB) {
+    out.write(`\x1b[${BAR_ROW};1H${barLine(S.current.pct)}\x1b[K`);   // shimmer along the bar
+    return;
+  }
   if (!(S.view === 'idle' || S.view === 'done')) return;
   if (Date.now() - lastActivity > 10 * 60 * 1000) return;
   const pos = ((Date.now() % SWEEP_PERIOD) / SWEEP_PERIOD) * 1.3 - 0.15;
@@ -366,42 +377,56 @@ function draw() {
   }
 }
 
-// Lists the pending queue. startNum=2 while something is uploading (that one is #1).
+// Lists the pending queue as a section. startNum=2 while something is uploading (that one is #1).
 function queueLines(startNum = 1) {
   const q = S.queue;
   if (!q.length) return [];
-  const lines = [];
+  const lines = ['', rule(`Queue · ${plural(q.length, 'clip')}`)];
   q.slice(0, 4).forEach((f, i) => {
     let size = ''; try { size = fmtBytes(fs.statSync(f).size); } catch {}
-    lines.push(lr(`  ${i === 0 ? `${C.dim}Queue${C.reset}` : '     '}  ${C.dim}${i + startNum}.${C.reset} ${clip(prettyTitle(path.parse(f).name).title, 40)}`, `${C.dim}${size}${C.reset}`));
+    lines.push(lr(`  ${C.dim}${i + startNum}.${C.reset} ${clip(prettyTitle(path.parse(f).name).title, 48)}`, `${C.dim}${size}${C.reset}`));
   });
-  if (q.length > 4) lines.push(`         ${C.dim}… and ${q.length - 4} more${C.reset}`);
+  if (q.length > 4) lines.push(`     ${C.dim}… and ${q.length - 4} more${C.reset}`);
   return lines;
 }
+
+// Progress bar with a shimmer that travels along the filled part.
+function barLine(pct, shimmer = true) {
+  const barW = 40, filled = Math.round(barW * pct / 100);
+  let bar = '';
+  const pos = shimmer ? Math.floor((Date.now() % 1200) / 1200 * (filled + 6)) - 3 : -99;
+  for (let i = 0; i < filled; i++) bar += (Math.abs(i - pos) <= 1 ? C.brightGreen : C.green) + '█';
+  bar += `${C.dim}${'░'.repeat(barW - filled)}${C.reset}`;
+  return `  ${bar}  ${C.bold}${pct}%${C.reset}`;
+}
+const BAR_ROW = 6;   // compact header rows 1–3, "▲ Uploading" row 4, blank row 5, bar row 6
 
 function drawIdle() {
   setTitle('Watching');
   const L = header(true);
-  const exts = CFG.extensions.map(e => e.slice(1)).join(' · ');
-  L.push(lr(`  ${C.green}●${C.reset} Watching ${C.dim}${clip(WATCH_DIR, 40)}${C.reset}`, `${C.dim}${exts}${C.reset}`));
+  const exts = CFG.extensions.map(e => e.slice(1)).join('  ');
+  L.push(lr(`  ${C.green}●${C.reset} Watching ${C.bold}${clip(shortPath(WATCH_DIR), 40)}${C.reset}`, `${C.dim}${exts}${C.reset}`));
   L.push('');
+  L.push(rule('Last upload'));
   const last = S.last || lastUpload();
   if (last) {
-    L.push(lr(`  ${C.dim}Last upload${C.reset}   ${clip(last.title, 36)}`, `${C.dim}${last.sizeMB ? fmtBytes(last.sizeMB * 1048576) : ''}${last.elapsed ? ` · ${last.elapsed}s` : ''}${C.reset}`));
-    L.push(`                ${C.cyan}${last.url.replace('https://', '')}${C.reset}`);
+    L.push(lr(`  ${clip(last.title, 48)}`, `${C.dim}${last.sizeMB ? fmtBytes(last.sizeMB * 1048576) : ''}${last.elapsed ? ` · ${last.elapsed}s` : ''}${C.reset}`));
+    L.push(`  ${link(last.url)}`);
   } else {
     L.push(`  ${C.dim}No uploads yet — drop a clip in the folder.${C.reset}`);
   }
   L.push('');
-  const today = uploadsToday();
-  const todayCol = today >= CFG.dailyUploadLimit ? C.red : today >= CFG.dailyUploadLimit - 1 ? C.yellow : '';
-  L.push(lr(`  ${C.dim}Today${C.reset}         ${todayCol}${today} of ${CFG.dailyUploadLimit} uploads used${C.reset}`, `${C.dim}resets ${fmtClock(pacificMidnight(1))}${C.reset}`));
+  L.push(rule('Today'));
+  const today = uploadsToday(), limit = CFG.dailyUploadLimit;
+  const todayCol = today >= limit ? C.red : today >= limit - 1 ? C.yellow : C.cyan;
+  const bar = `${todayCol}${'▰'.repeat(Math.min(today, limit))}${C.dim}${'▱'.repeat(Math.max(0, limit - today))}${C.reset}`;
+  L.push(lr(`  ${bar}  ${plural(today, 'upload')}${today >= limit ? ` — limit reached` : ''}`, `${C.dim}resets in ${fmtDuration((pacificMidnight(1) - Date.now()) / 1000)}${C.reset}`));
   const onDisk = uploadedOnDisk();
   if (onDisk.length) {
     const size = onDisk.reduce((a, e) => { try { return a + fs.statSync(e.path).size; } catch { return a; } }, 0);
-    L.push(lr(`  ${C.dim}On disk${C.reset}       ${onDisk.length} uploaded clip(s) · ${fmtBytes(size)}`, `${C.yellow}[D] to clean${C.reset}`));
+    L.push(lr(`  ${C.yellow}${fmtBytes(size)}${C.reset} in ${plural(onDisk.length, 'uploaded clip')} waiting for clean-up`, `${C.dim}press${C.reset} ${cap('D')}`));
   }
-  if (S.queue.length) { L.push(''); L.push(...queueLines()); }
+  L.push(...queueLines());
   if (S.notice) { L.push(''); L.push(`  ${C.green}${S.notice}${C.reset}`); }
   L.push('');
   const k = [];
@@ -419,10 +444,10 @@ function drawUploading() {
   const L = header();
   L.push(lr(`  ${C.green}▲ Uploading${C.reset}  ${clip(c.title, 40)}`, `${C.dim}${fmtBytes(c.sizeMB * 1048576)}${C.reset}`));
   L.push('');
-  const barW = 40, filled = Math.round(barW * c.pct / 100);
-  L.push(`  ${C.green}${'█'.repeat(filled)}${C.dim}${'░'.repeat(barW - filled)}${C.reset}  ${C.bold}${c.pct}%${C.reset}`);
-  L.push(`  ${C.dim}${c.speed > 0 ? `${fmtSpeed(c.speed)} · ${fmtDuration(c.eta)} left` : c.status || 'starting…'}${C.reset}`);
-  if (S.queue.length) { L.push(''); L.push(...queueLines(2)); }
+  L.push(barLine(c.pct));
+  const spark = c.speeds && c.speeds.length > 1 ? `   ${C.cyan}${sparkline(c.speeds)}${C.reset}` : '';
+  L.push(`  ${C.dim}${c.speed > 0 ? `${fmtSpeed(c.speed)} · ${fmtDuration(c.eta)} left` : c.status || 'starting…'}${C.reset}${spark}`);
+  L.push(...queueLines(2));
   L.push('');
   const k = [['X', 'cancel this']];
   if (S.queue.length) k.push(['S', 'skip next']);
@@ -436,11 +461,11 @@ function drawDone() {
   const h = S.last;
   const L = header(true);
   L.push(lr(`  ${C.green}${C.bold}✓ Uploaded${C.reset}   ${clip(h.title, 38)}`, `${C.dim}${fmtBytes(h.sizeMB * 1048576)} · ${h.elapsed}s${C.reset}`));
-  L.push(lr(`  ${C.cyan}${h.url.replace('https://', '')}${C.reset}`, `${C.green}link copied${C.reset}`));
+  L.push(lr(`  ${link(h.url)}`, `${C.green}link copied${C.reset}`));
   L.push('');
   L.push(`  ${C.dim}Privacy${C.reset}  ${h.privacy || CFG.privacy}        ${C.dim}Tags${C.reset}  ${(h.tags || []).join(', ')}`);
   if (S.notice) { L.push(''); L.push(`  ${C.green}${S.notice}${C.reset}`); }
-  if (S.queue.length) { L.push(''); L.push(...queueLines()); }
+  L.push(...queueLines());
   L.push('');
   L.push(keys(['T', 'edit title'], ['P', 'privacy'], ['C', 'copy'], ['O', 'open'], ['Q', 'minimize']));
   render(L);
@@ -454,7 +479,7 @@ function drawError() {
   L.push('');
   L.push(`  ${C.red}${clip(e.message, W - 4)}${C.reset}`);
   if (e.hint) L.push(`  ${C.dim}${clip(e.hint, W - 4)}${C.reset}`);
-  if (S.queue.length) { L.push(''); L.push(...queueLines()); }
+  L.push(...queueLines());
   L.push('');
   const k = [];
   if (e.kind === 'auth') k.push(['A', 'sign in again']);
@@ -472,7 +497,7 @@ function drawWaiting() {
   L.push('');
   L.push(`  ${C.dim}Resuming in ${fmtDuration(left)} (${fmtClock(S.waitUntil)})${C.reset}`);
   if (S.waitFile) L.push(`  ${C.dim}Next: ${clip(path.basename(S.waitFile), 50)}${C.reset}`);
-  if (S.queue.length) { L.push(''); L.push(...queueLines()); }
+  L.push(...queueLines());
   L.push('');
   L.push(keys(['Enter', 'retry now'], ['Esc', 'give up on this clip'], ['Q', 'minimize']));
   render(L);
@@ -496,7 +521,7 @@ function drawHistory() {
       const date = (h.date || '').slice(0, 16);
       const line = `${sel ? `${C.cyan}▸${C.reset}` : ' '} ${mark} ${C.dim}${date}${C.reset}  ${sel ? C.bold : ''}${clip(h.title, 30)}${C.reset}`;
       L.push(lr(' ' + line, `${C.dim}${h.sizeMB ? fmtBytes(h.sizeMB * 1048576) : ''}${C.reset}`));
-      if (sel) L.push(`        ${C.cyan}${h.url ? h.url.replace('https://', '') : (h.error || '')}${C.reset}`);
+      if (sel) L.push(`        ${h.url ? link(h.url) : `${C.red}${h.error || ''}${C.reset}`}`);
     });
     if (start + rows < history.length) L.push(`  ${C.dim}… ${history.length - start - rows} more below${C.reset}`);
   }
@@ -536,7 +561,7 @@ function drawDelete() {
 function drawEdit() {
   setTitle('Edit title');
   const L = header();
-  L.push(`  ${C.bold}Edit title${C.reset}   ${C.dim}${clip(S.last.url.replace('https://', ''), 40)}${C.reset}`);
+  L.push(`  ${C.bold}Edit title${C.reset}   ${link(S.last.url)}`);
   L.push('');
   L.push(`  ${C.dim}Current:${C.reset} ${clip(S.last.title, 56)}`);
   L.push('');
@@ -658,13 +683,19 @@ async function uploadVideo(auth, filepath) {
   const c = S.current;
   const fileSize = fs.statSync(filepath).size;
   const startTime = Date.now();
-  let lastDraw = 0, lastLoggedQuarter = 0;
+  let lastDraw = 0, lastLoggedQuarter = 0, lastSample = 0, lastSampleBytes = 0;
+  c.speeds = [];
   const onProgress = (bytes) => {
     const pct = Math.min(100, Math.round((bytes / fileSize) * 100));
     const elapsed = (Date.now() - startTime) / 1000;
     c.pct = pct;
     c.speed = elapsed > 0.5 ? bytes / elapsed : 0;
     c.eta = c.speed > 0 ? (fileSize - bytes) / c.speed : 0;
+    if (Date.now() - lastSample >= 1000) {   // instantaneous speed sample for the sparkline
+      if (lastSample) c.speeds.push((bytes - lastSampleBytes) / ((Date.now() - lastSample) / 1000));
+      if (c.speeds.length > 16) c.speeds.shift();
+      lastSample = Date.now(); lastSampleBytes = bytes;
+    }
     const q = Math.floor(pct / 25);
     if (q > lastLoggedQuarter) { lastLoggedQuarter = q; log(`  Progress: ${q * 25}%`); }
     if (Date.now() - lastDraw > 150 || pct === 100) { lastDraw = Date.now(); if (S.view === 'uploading') draw(); }
