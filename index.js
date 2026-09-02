@@ -287,19 +287,39 @@ function grad(t) {
   return [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f, a[2] + (b[2] - a[2]) * f];
 }
 // Colors a line left→right along the gradient; box-drawing "shadow" glyphs get a darker shade.
-function gradientLine(line, width) {
+// `sweep` (0..1, or null) is the position of a bright scanline passing over the letters.
+function gradientLine(line, width, sweep = null) {
   let out = '', last = '';
   for (let i = 0; i < line.length; i++) {
     const ch = line[i];
     if (ch === ' ') { out += ' '; continue; }
-    let c = grad(i / Math.max(1, width - 1));
-    if ('╗╔╚╝║═'.includes(ch)) c = c.map(v => v * PAL.shadow);
+    const x = i / Math.max(1, width - 1);
+    let m = 1;
+    if (sweep !== null) { const d = Math.abs(x - sweep); if (d < 0.07) m = 1.6 - d * 8; }
+    if ('╗╔╚╝║═'.includes(ch)) m *= PAL.shadow;
+    const c = grad(x).map(v => Math.min(255, v * m));
     const code = rgb(c);
     if (code !== last) { out += code; last = code; }
     out += ch;
   }
   return out + C.reset;
 }
+
+// Sweep animation: repaints only the UPLOADER rows (rows 7–12 of the full header) ~15×/s
+// while the full logo is on screen and there was activity in the last 10 minutes.
+const SWEEP_PERIOD = 1500;   // ms per pass
+const SWEEP_ROW0 = 7;        // header(): row 1 blank, rows 2–6 GAME, rows 7–12 UPLOADER
+let lastActivity = Date.now();
+const touch = () => { lastActivity = Date.now(); };
+function sweepTick() {
+  if (!(S.view === 'idle' || S.view === 'done')) return;
+  if (Date.now() - lastActivity > 10 * 60 * 1000) return;
+  const pos = ((Date.now() % SWEEP_PERIOD) / SWEEP_PERIOD) * 1.3 - 0.15;
+  let buf = '';
+  LOGO_UP.forEach((l, i) => { buf += `\x1b[${SWEEP_ROW0 + i};1H  ${gradientLine(l, LOGO_W, pos)}\x1b[K`; });
+  out.write(buf);
+}
+setInterval(sweepTick, 66);
 const wordmark = () => `${rgb(PAL.game)}${C.bold}GAME${C.reset} ${C.bold}${gradientLine('UPLOADER', 8)}`;
 
 const startedAt = Date.now();
@@ -721,6 +741,7 @@ async function handleFile(filepath) {
   S.current = { filepath, filename, title, tags, sizeMB: 0, pct: 0, speed: 0, eta: 0, status: 'waiting for recording to finish…' };
   S.cancelled = false;
   S.view = 'uploading';
+  touch();
   log(`New video detected: ${filename}`);
   if (CFG.popupOnUpload) restoreSelf(); else flashTaskbar();
   draw();
@@ -858,6 +879,7 @@ if (process.stdin.isTTY) process.stdin.setRawMode(true);
 process.stdin.resume();
 
 process.stdin.on('keypress', (str, k = {}) => {
+  touch();
   if (k.ctrl && k.name === 'c') { shutdown(); return; }
   const ch = (str || '').toLowerCase();
   const name = k.name || '';
