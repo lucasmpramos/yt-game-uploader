@@ -1,17 +1,19 @@
 {
   "name": "gameuploader",
-  "version": "1.0.0",
+  "version": "1.1.0",
+  "description": "Watches a folder and auto-uploads gameplay clips to YouTube",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node index.js",
+    "auth": "node index.js --auth",
+    "demo": "node index.js --simulate"
   },
-  "keywords": [],
-  "author": "",
+  "engines": {
+    "node": ">=18"
+  },
   "license": "ISC",
-  "description": "",
   "dependencies": {
     "chokidar": "^5.0.0",
-    "clipboardy": "^5.3.1",
     "googleapis": "^171.4.0",
     "node-notifier": "^10.0.1",
     "open": "^11.0.0"

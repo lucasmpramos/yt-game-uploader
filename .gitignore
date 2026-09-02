@@ -1,17 +1,11 @@
 node_modules/
-token.json
+
+# Secrets and per-machine state
 client_secret.json
+token.json
+config.json
 uploaded.json
 history.json
-progress.json
-_winctl.ps1
-_launch_ui.*
-_ui_launch.*
+*.sim.json
 *.log
-*.pyc
-
-# Legacy Python files
-*.py
-start_hidden.vbs
-start_uploader.*
-task.xml
+_winctl.ps1

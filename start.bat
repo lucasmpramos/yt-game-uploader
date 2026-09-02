@@ -1,3 +1,2 @@
 @echo off
-cd /d "C:\Users\Lucas Machado\GameUploader"
-node index.js
+start "" wt.exe -d "C:\Users\Lucas Machado\GameUploader" --title GameUploader node index.js
