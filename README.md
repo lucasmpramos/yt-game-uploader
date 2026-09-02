@@ -30,12 +30,13 @@ Record gameplay → Clip saved to folder → Detected → Uploaded → Toast + l
 ## Keyboard
 
 ```
-Idle        C copy last link · O open · H history · D clean up · R restart · Q minimize
-Uploading   X cancel this · S skip next · Q minimize
-Done        T edit title · P privacy · C copy · O open · Q minimize
+Dashboard   C copy last link · O open · L open in YouTube Studio · T edit title · P privacy
+            H history · F open folder · D clean up · R restart · Q minimize
+Uploading   T edit title · P privacy (applied when the upload finishes) · X cancel · S skip next · Q minimize
+Done        T edit title · P privacy · C copy · O open · L studio · Q minimize
 Error       Enter retry · A sign in again · Esc give up · Q minimize
-History     ↑↓ select · Enter open · C copy link · Esc back
-Anywhere    Ctrl+C quit
+History     ↑↓ select · Enter open · C copy link · X delete that file from disk · Esc back
+Anywhere    ? help · Esc back · Ctrl+C quit
 ```
 
 ## Features
@@ -45,9 +46,17 @@ Anywhere    Ctrl+C quit
 - **Windows toast** on completion; clicking it opens the video
 - **Nice titles** — `ARC Raiders - 2026-08-27 12-57-02 AM.mp4` becomes `ARC Raiders — Aug 27, 2026 00:57`, and the game name is added as a tag
 - **Daily limit awareness** — YouTube's API allows roughly 6 uploads per day on the default quota; the app shows your count, and if you hit the limit it queues the clip and resumes automatically after the reset
-- **Auto clean-up** — clips are deleted from disk 7 days after a confirmed upload (`deleteAfterDays`, 0 to disable); `D` cleans up immediately
+- **Auto clean-up** — clips are deleted from disk 7 days after a confirmed upload (`deleteAfterDays`, 0 to disable); `D` cleans up immediately, or `X` on a single entry in History
+- **Resumable uploads** — a dropped connection continues from the last confirmed byte instead of restarting a multi-GB clip; an upload session even survives an app restart
+- **Waits for the recorder** — uploads start only when the file has stopped growing *and* no other program still has it open for writing
+- **Playlists per game** — every clip lands in a playlist named after the game (created on first use); override the name per game in config
+- **"Ready in full quality" alert** — a second toast when YouTube has finished processing, so you don't share a 360p link
+- **Templates** — title and description from `{game} {date} {time} {file} {size}`, with per-game overrides for privacy, tags, playlist, and templates
+- **Live settings** — edit `config.json` and the app applies it without a restart
 - **Upload queue**, retry with backoff, cancel and skip
+- **Crash-proof** — `run.bat` restarts the app if it ever dies; `R` restarts on demand
 - **Auto-start** with Windows via the Startup folder
+- **Retro console jingles** for done / error / ready (`sounds: false` to mute)
 
 ## Setup
 
@@ -97,10 +106,19 @@ On first run a `config.json` is created with defaults you can edit:
 | `deleteAfterDays` | `7` | Auto-delete uploaded clips from disk after N days (0 = never) |
 | `dailyUploadLimit` | `6` | Your YouTube API daily upload allowance |
 | `minSizeMB` | `1` | Ignore files smaller than this |
+| `titleTemplate` | `{game} — {date} {time}` | YouTube title (only used when a game name is found in the filename) |
+| `descriptionTemplate` | `{game} gameplay · {date}\nUploaded automatically by GameUploader` | YouTube description |
+| `playlists` | `true` | Add each clip to a playlist named after the game |
+| `hdReadyToast` | `true` | Notify when YouTube has finished processing the clip |
+| `games` | `{}` | Per-game overrides, e.g. `{ "ARC Raiders": { "privacy": "public", "tags": ["arc raiders"], "playlist": "ARC clips", "titleTemplate": "[{game}] {date}" } }` |
+
+Changes to `config.json` are picked up live — no restart needed.
+
+**Permissions:** the first sign-in grants the full YouTube permission (needed for playlists and processing status). If you signed in with an older version you'll see a one-line reminder on the dashboard — press `A` to re-sign in once.
 
 ### 5. Auto-start with Windows (optional)
 
-Copy `start.bat` into `shell:startup` (Win+R → `shell:startup`). It launches the app minimized in Windows Terminal.
+Copy `start.bat` into `shell:startup` (Win+R → `shell:startup`). It opens `run.bat` in a Windows Terminal tab, which keeps the app alive: crashes restart it after 5 s, and `R` restarts it instantly.
 
 ## Demo mode
 
@@ -110,16 +128,27 @@ npm run demo
 
 Runs the full UI with fake uploads and separate `*.sim.json` data files — useful for trying the screens without touching YouTube or your real history.
 
+## Tests
+
+```bash
+npm test
+```
+
+Unit tests for title parsing, templates and overrides, file-lock detection (with a really locked file), and the resumable upload protocol against a local mock of YouTube's upload server that drops connections mid-way.
+
 ## Files
 
 ```
-index.js          The whole app
-config.json       Your settings (created on first run)
+index.js          The app (UI, queue, YouTube calls)
+resumable.js      Resumable upload protocol
+run.bat           Keeps the app running (auto-restart); start.bat opens it in Windows Terminal
+config.json       Your settings (created on first run, reloaded live)
 client_secret.json  Google OAuth client (you provide)
 token.json        Your sign-in token (created by npm run auth)
 history.json      Last 100 uploads
 uploaded.json     Which files were handled (uploaded / skipped / cancelled)
-uploader.log      Log
+playlists.json    Playlist name → id cache
+uploader.log      Log (rotates at 1 MB)
 ```
 
 ## License

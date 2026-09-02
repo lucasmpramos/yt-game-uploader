@@ -6,6 +6,8 @@ token.json
 config.json
 uploaded.json
 history.json
+playlists.json
+upload-session.json
 *.sim.json
 *.log
 _winctl.ps1

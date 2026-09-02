@@ -1,2 +1,4 @@
 @echo off
-start "" wt.exe -d "C:\Users\Lucas Machado\GameUploader" --title GameUploader node index.js
+rem Opens GameUploader in a Windows Terminal tab. run.bat keeps it alive (auto-restart on crash).
+rem For auto-start with Windows, put a copy in shell:startup with the absolute path below.
+start "" wt.exe -d "%~dp0" --title GameUploader cmd /c run.bat

@@ -6,6 +6,7 @@ const readline = require('readline');
 const { spawn, execFile } = require('child_process');
 const { google } = require('googleapis');
 const chokidar = require('chokidar');
+const { resumableUpload } = require('./resumable');
 
 const VERSION = require('./package.json').version;
 const SIMULATE = process.argv.includes('--simulate');   // fake uploads, separate data files
@@ -38,32 +39,49 @@ const DEFAULT_CONFIG = {
   deleteAfterDays: 7,
   dailyUploadLimit: 6,
   minSizeMB: 1,
+  // Placeholders: {game} {date} {time} {file} {size}
+  titleTemplate: '{game} — {date} {time}',
+  descriptionTemplate: '{game} gameplay · {date}\nUploaded automatically by GameUploader',
+  playlists: true,        // add each clip to a playlist named after the game (needs the full YouTube permission)
+  hdReadyToast: true,     // notify when YouTube has finished processing the clip (full quality available)
+  // Per-game overrides, matched case-insensitively against the game name parsed from the filename:
+  // "games": { "ARC Raiders": { "privacy": "public", "tags": ["arc raiders", "extraction"], "playlist": "ARC clips" } }
+  games: {},
 };
 
+// Returns { cfg, error }. `error` is set when config.json exists but can't be parsed (defaults are used).
 function loadConfig() {
-  let fileCfg = {};
+  let fileCfg = {}, error = null;
   if (fs.existsSync(CONFIG_FILE)) {
-    try { fileCfg = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8')); } catch {}
-  } else {
-    fs.writeFileSync(CONFIG_FILE, JSON.stringify(DEFAULT_CONFIG, null, 2));
+    try { fileCfg = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8')); } catch (e) { error = e.message; }
   }
   const cfg = { ...DEFAULT_CONFIG, ...fileCfg };
   if (argValue('--watch')) cfg.watchDir = argValue('--watch');
   if (!cfg.watchDir || typeof cfg.watchDir !== 'string') cfg.watchDir = DEFAULT_CONFIG.watchDir;
   if (!Array.isArray(cfg.extensions) || !cfg.extensions.length) cfg.extensions = DEFAULT_CONFIG.extensions;
   cfg.extensions = cfg.extensions.map(e => (e.startsWith('.') ? e : '.' + e).toLowerCase());
-  return cfg;
+  if (!cfg.games || typeof cfg.games !== 'object') cfg.games = {};
+  if (!Array.isArray(cfg.tags)) cfg.tags = DEFAULT_CONFIG.tags;
+  // Write the file back when it's missing or lacks newer keys, so every option is discoverable.
+  const missing = Object.keys(DEFAULT_CONFIG).some(k => !(k in fileCfg));
+  if (!error && missing && !argValue('--config')) {
+    try { fs.writeFileSync(CONFIG_FILE, JSON.stringify({ ...DEFAULT_CONFIG, ...fileCfg }, null, 2)); } catch {}
+  }
+  return { cfg, error };
 }
-const CFG = loadConfig();
-const WATCH_DIR = CFG.watchDir;
-const MIN_SIZE = CFG.minSizeMB * 1024 * 1024;
+const CFG = loadConfig().cfg;   // mutated in place by reloadConfig() so every reference sees updates
+const gameOverrides = (game) => { if (!game) return {}; const k = Object.keys(CFG.games).find(k => k.toLowerCase() === game.toLowerCase()); return k ? CFG.games[k] || {} : {}; };
 
 // ---------------------------------------------------------------------------
 // Small utils
 // ---------------------------------------------------------------------------
 function log(msg) {
   const ts = new Date().toLocaleString('sv-SE');
-  try { fs.appendFileSync(LOG_FILE, `${ts} - ${msg}\n`); } catch {}
+  try {
+    // Rotate at 1 MB: keep one previous log.
+    try { if (fs.statSync(LOG_FILE).size > 1024 * 1024) fs.renameSync(LOG_FILE, LOG_FILE + '.1'); } catch {}
+    fs.appendFileSync(LOG_FILE, `${ts} - ${msg}\n`);
+  } catch {}
 }
 function loadJson(p, fallback = []) {
   try { return JSON.parse(fs.readFileSync(p, 'utf-8')); } catch { return fallback; }
@@ -125,12 +143,36 @@ function prettyTitle(basename) {
     const ampm = (m[8] || '').toUpperCase();
     if (ampm === 'PM' && hour < 12) hour += 12;
     if (ampm === 'AM' && hour === 12) hour = 0;
-    const date = new Date(+m[2], +m[3] - 1, +m[4]);
-    const day = date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+    const when = new Date(+m[2], +m[3] - 1, +m[4], hour, +m[6], +m[7]);
+    const date = when.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
     const time = `${String(hour).padStart(2, '0')}:${m[6]}`;
-    return { title: `${game || 'Clip'} — ${day} ${time}`.slice(0, 100), game };
+    return { title: `${game || 'Clip'} — ${date} ${time}`.slice(0, 100), game, date, time, when };
   }
-  return { title: raw.replace(/_/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 100), game: '' };
+  return { title: raw.replace(/_/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 100), game: '', date: '', time: '', when: null };
+}
+
+// Everything YouTube needs for a clip, from the filename + config templates + per-game overrides.
+function buildMeta(filepath) {
+  const name = path.parse(filepath).name;
+  const p = prettyTitle(name);
+  let size = 0; let when = p.when;
+  try { const st = fs.statSync(filepath); size = st.size; if (!when) when = st.mtime; } catch {}
+  const vars = {
+    game: p.game || p.title,
+    date: when ? when.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : '',
+    time: when ? `${String(when.getHours()).padStart(2, '0')}:${String(when.getMinutes()).padStart(2, '0')}` : '',
+    file: p.title,
+    size: fmtBytes(size),
+  };
+  const fill = (tpl) => String(tpl || '').replace(/\{(\w+)\}/g, (_, k) => (k in vars ? vars[k] : `{${k}}`)).trim();
+  const g = gameOverrides(p.game);
+  // Without a recognizable game in the filename the template would read "— Aug 27…", so use the cleaned filename instead.
+  const title = (p.game ? fill(g.titleTemplate || CFG.titleTemplate) : p.title).slice(0, 100) || 'Clip';
+  const description = fill(g.descriptionTemplate || CFG.descriptionTemplate).slice(0, 5000);
+  const tags = [...new Set([...(p.game ? [p.game.toLowerCase()] : []), ...(Array.isArray(g.tags) ? g.tags : CFG.tags)])].slice(0, 30);
+  const privacy = ['public', 'private', 'unlisted'].includes(g.privacy) ? g.privacy : CFG.privacy;
+  const playlist = CFG.playlists ? (g.playlist || p.game || null) : null;
+  return { title, description, tags, privacy, playlist, game: p.game, filename: path.basename(filepath) };
 }
 
 // ---------------------------------------------------------------------------
@@ -214,10 +256,23 @@ const minimizeSelf = () => winctl('minimize');
 const restoreSelf = () => winctl('restore');
 const flashTaskbar = () => winctl('flash');
 
-function beepSuccess() { if (CFG.sounds) ps(['-Command', '[console]::beep(700,150);[console]::beep(900,150);[console]::beep(1100,200)']); }
-function beepError() { if (CFG.sounds) ps(['-Command', '[console]::beep(400,300);[console]::beep(300,400)']); }
+// Retro console-speaker jingles (frequency Hz, duration ms).
+const JINGLES = {
+  success: [[523, 90], [659, 90], [784, 90], [1047, 200]],        // C E G C — "level up"
+  error:   [[392, 180], [330, 180], [262, 360]],                   // G E C — "game over"
+  ready:   [[880, 70], [1175, 70], [1760, 140]],                   // "item get"
+  tick:    [[1200, 40]],
+};
+function jingle(name) {
+  if (!CFG.sounds || !JINGLES[name]) return;
+  ps(['-Command', JINGLES[name].map(([f, d]) => `[console]::beep(${f},${d})`).join(';')]);
+}
+const beepSuccess = () => jingle('success');
+const beepError = () => jingle('error');
 function copyToClipboard(text) { if (CFG.clipboard) ps(['-Command', `Set-Clipboard -Value '${String(text).replace(/'/g, "''")}'`]); }
 function openInBrowser(url) { try { spawn('cmd', ['/c', 'start', '', url], { windowsHide: true, detached: true, stdio: 'ignore' }).unref(); } catch {} }
+function openFolder(dir) { try { spawn('explorer.exe', [dir], { windowsHide: true, detached: true, stdio: 'ignore' }).unref(); } catch {} }
+const studioUrl = videoId => `https://studio.youtube.com/video/${videoId}/edit`;
 
 // Windows toasts via the native WinRT API (through Windows PowerShell). Clicking the toast opens `url`.
 // Desktop apps need a Start Menu shortcut carrying an AppUserModelID for toasts to show; SnoreToast's
@@ -250,7 +305,7 @@ function toast(title, message, url) {
 const C = { reset: '\x1b[0m', bold: '\x1b[1m', dim: '\x1b[90m', cyan: '\x1b[36m', green: '\x1b[32m', brightGreen: '\x1b[92m', yellow: '\x1b[33m', red: '\x1b[31m', underline: '\x1b[4m', inv: '\x1b[7m', noinv: '\x1b[27m' };
 const W = 68;
 const out = process.stdout;
-const vis = s => s.replace(/\x1b\[[0-9;]*m/g, '').length;
+const vis = s => s.replace(/\x1b\[[0-9;]*m/g, '').replace(/\x1b\]8;;[^\x1b\x07]*(?:\x1b\\|\x07)/g, '').length;   // ignore SGR colors and OSC 8 links
 const clip = (s, n) => (vis(s) <= n ? s : s.slice(0, Math.max(0, n - 1)) + '…');
 const lr = (left, right) => { const gap = W - vis(left) - vis(right); return left + ' '.repeat(Math.max(1, gap)) + right; };
 const cap = k => `${C.inv} ${k} ${C.noinv}`;                        // key cap: inverse-video " C "
@@ -259,7 +314,9 @@ const keys = (...pairs) => '  ' + pairs.map(([k, l]) => key(k, l)).join('  ');
 const rule = label => `  ${C.dim}── ${label} ${'─'.repeat(Math.max(0, W - 6 - label.length))}${C.reset}`;
 const plural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
 const shortPath = p => (p.toLowerCase().startsWith(os.homedir().toLowerCase()) ? '~' + p.slice(os.homedir().length) : p);
-const link = url => `${C.cyan}${C.underline}${url.replace(/^https?:\/\//, '')}${C.reset}`;
+// Clickable link: OSC 8 hyperlink (Ctrl+click in Windows Terminal) around the full URL, which
+// also keeps the terminal's own URL auto-detection working.
+const link = url => `\x1b]8;;${url}\x1b\\${C.cyan}${C.underline}${url}${C.reset}\x1b]8;;\x1b\\`;
 const SPARK = '▁▂▃▄▅▆▇█';
 const sparkline = (vals) => { const max = Math.max(1, ...vals); return vals.map(v => SPARK[Math.min(7, Math.floor((v / max) * 7.99))]).join(''); };
 
@@ -330,7 +387,6 @@ function sweepTick() {
   LOGO_UP.forEach((l, i) => { buf += `\x1b[${SWEEP_ROW0 + i};1H  ${gradientLine(l, LOGO_W, pos)}\x1b[K`; });
   out.write(buf);
 }
-setInterval(sweepTick, 66);
 const wordmark = () => `${rgb(PAL.game)}${C.bold}GAME${C.reset} ${C.bold}${gradientLine('UPLOADER', 8)}`;
 
 const startedAt = Date.now();
@@ -359,13 +415,17 @@ const S = {
   error: null,           // { filename, message, hint, kind, filepath }
   waitUntil: 0, waitReason: '', waitFile: null,
   histCursor: 0,
+  histConfirm: null,
   editBuf: '',
   notice: '',
   authNeeded: false,
+  helpReturn: 'idle',
+  polls: new Set(),      // videoIds being polled for processing status
 };
 
 function draw() {
   switch (S.view) {
+    case 'help': return drawHelp();
     case 'idle': return drawIdle();
     case 'uploading': return drawUploading();
     case 'done': return drawDone();
@@ -405,7 +465,7 @@ function drawIdle() {
   setTitle('Watching');
   const L = header(true);
   const exts = CFG.extensions.map(e => e.slice(1)).join('  ');
-  L.push(lr(`  ${C.green}●${C.reset} Watching ${C.bold}${clip(shortPath(WATCH_DIR), 40)}${C.reset}`, `${C.dim}${exts}${C.reset}`));
+  L.push(lr(`  ${C.green}●${C.reset} Watching ${C.bold}${clip(shortPath(CFG.watchDir), 40)}${C.reset}`, `${C.dim}${exts}${C.reset}`));
   L.push('');
   L.push(rule('Last upload'));
   const last = S.last || lastUpload();
@@ -427,14 +487,38 @@ function drawIdle() {
     L.push(lr(`  ${C.yellow}${fmtBytes(size)}${C.reset} in ${plural(onDisk.length, 'uploaded clip')} waiting for clean-up`, `${C.dim}press${C.reset} ${cap('D')}`));
   }
   L.push(...queueLines());
+  if (needsFullScope()) { L.push(''); L.push(lr(`  ${C.yellow}Playlists and HD-ready alerts need a one-time re-sign-in${C.reset}`, `${C.dim}press${C.reset} ${cap('A')}`)); }
   if (S.notice) { L.push(''); L.push(`  ${C.green}${S.notice}${C.reset}`); }
   L.push('');
-  const k = [];
-  if (last) k.push(['C', 'copy link'], ['O', 'open']);
-  k.push(['H', 'history']);
+  if (last) L.push(keys(['C', 'copy link'], ['O', 'open'], ['L', 'studio'], ['T', 'edit title'], ['P', `privacy: ${last.privacy || CFG.privacy}`]));
+  const k = [['H', 'history'], ['F', 'folder']];
   if (onDisk.length) k.push(['D', 'clean up']);
-  k.push(['R', 'restart'], ['Q', 'minimize']);
+  k.push(['?', 'help'], ['R', 'restart'], ['Q', 'minimize']);
   L.push(keys(...k));
+  render(L);
+}
+
+function drawHelp() {
+  setTitle('Help');
+  const L = header();
+  L.push(`  ${C.bold}Keys${C.reset}`);
+  L.push('');
+  const rows = [
+    ['Dashboard', [['C', 'copy last link'], ['O', 'open last clip'], ['L', 'open in YouTube Studio'], ['T', 'edit title'], ['P', 'cycle privacy']]],
+    ['', [['H', 'history'], ['F', 'open watch folder'], ['D', 'delete uploaded clips'], ['R', 'restart'], ['Q', 'minimize']]],
+    ['Uploading', [['T', 'title (applied at the end)'], ['P', 'privacy'], ['X', 'cancel'], ['S', 'skip next in queue']]],
+    ['History', [['↑↓', 'select'], ['Enter', 'open'], ['C', 'copy link'], ['X', 'delete that file from disk']]],
+    ['Errors', [['Enter', 'retry now'], ['A', 'sign in again'], ['Esc', 'give up on that clip']]],
+    ['Anywhere', [['?', 'this screen'], ['Esc', 'back'], ['Ctrl+C', 'quit']]],
+  ];
+  for (const [section, ks] of rows) {
+    L.push(`  ${C.dim}${section.padEnd(11)}${C.reset}${ks.map(([k, l]) => `${cap(k)} ${l}`).join('   ')}`);
+  }
+  L.push('');
+  L.push(`  ${C.dim}Settings live in ${shortPath(CONFIG_FILE)} — changes apply without a restart.${C.reset}`);
+  L.push(`  ${C.dim}Watching ${shortPath(CFG.watchDir)} · privacy ${CFG.privacy} · playlists ${CFG.playlists ? 'on' : 'off'} · auto-delete ${CFG.deleteAfterDays ? CFG.deleteAfterDays + ' days' : 'off'}${C.reset}`);
+  L.push('');
+  L.push(keys(['Esc', 'back']));
   render(L);
 }
 
@@ -449,7 +533,7 @@ function drawUploading() {
   L.push(`  ${C.dim}${c.speed > 0 ? `${fmtSpeed(c.speed)} · ${fmtDuration(c.eta)} left` : c.status || 'starting…'}${C.reset}${spark}`);
   L.push(...queueLines(2));
   L.push('');
-  const k = [['X', 'cancel this']];
+  const k = [['T', 'edit title'], ['P', `privacy: ${c.privacy}`], ['X', 'cancel']];
   if (S.queue.length) k.push(['S', 'skip next']);
   k.push(['Q', 'minimize']);
   L.push(keys(...k));
@@ -519,15 +603,29 @@ function drawHistory() {
       const idx = start + i, sel = idx === S.histCursor;
       const mark = h.success ? `${C.green}✓${C.reset}` : `${C.red}✗${C.reset}`;
       const date = (h.date || '').slice(0, 16);
+      const onDisk = historyFilePath(h) ? `${C.dim}●${C.reset}` : ' ';
       const line = `${sel ? `${C.cyan}▸${C.reset}` : ' '} ${mark} ${C.dim}${date}${C.reset}  ${sel ? C.bold : ''}${clip(h.title, 30)}${C.reset}`;
-      L.push(lr(' ' + line, `${C.dim}${h.sizeMB ? fmtBytes(h.sizeMB * 1048576) : ''}${C.reset}`));
+      L.push(lr(' ' + line, `${onDisk} ${C.dim}${h.sizeMB ? fmtBytes(h.sizeMB * 1048576) : ''}${C.reset}`));
       if (sel) L.push(`        ${h.url ? link(h.url) : `${C.red}${h.error || ''}${C.reset}`}`);
     });
     if (start + rows < history.length) L.push(`  ${C.dim}… ${history.length - start - rows} more below${C.reset}`);
   }
   L.push('');
-  L.push(keys(['↑↓', 'select'], ['Enter', 'open'], ['C', 'copy link'], ['Esc', 'back']));
+  const cur = history[S.histCursor];
+  if (S.histConfirm !== null && cur) {
+    L.push(lr(`  ${C.yellow}Delete ${clip(path.basename(historyFilePath(cur) || ''), 40)} from disk?${C.reset}`, `${cap('Y')} yes   ${cap('N')} no`));
+  } else {
+    L.push(lr(keys(['↑↓', 'select'], ['Enter', 'open'], ['C', 'copy link'], ['X', 'delete file'], ['Esc', 'back']), `${C.dim}● still on disk${C.reset}`));
+  }
   render(L);
+}
+
+// Local file for a history entry, if it still exists (matched through uploaded.json by videoId, else by filename).
+function historyFilePath(h) {
+  let p = null;
+  if (h.videoId) { const e = loadUploaded().find(e => e.videoId === h.videoId); if (e) p = e.path; }
+  if (!p && h.filename) p = path.join(CFG.watchDir, h.filename);
+  return p && fs.existsSync(p) ? p : null;
 }
 
 function drawDelete() {
@@ -561,26 +659,38 @@ function drawDelete() {
 function drawEdit() {
   setTitle('Edit title');
   const L = header();
-  L.push(`  ${C.bold}Edit title${C.reset}   ${link(S.last.url)}`);
+  const editingCurrent = S.editTarget === 'current' && S.current;
+  L.push(`  ${C.bold}Edit title${C.reset}   ${editingCurrent ? `${C.dim}applies when the upload finishes${C.reset}` : link(S.last.url)}`);
   L.push('');
-  L.push(`  ${C.dim}Current:${C.reset} ${clip(S.last.title, 56)}`);
+  L.push(`  ${C.dim}Current:${C.reset} ${clip(editingCurrent ? S.current.title : S.last.title, 56)}`);
   L.push('');
-  L.push(`  ${C.cyan}›${C.reset} ${S.editBuf}${C.cyan}_${C.reset}`);
+  L.push(`  ${C.cyan}›${C.reset} ${S.editFresh ? `${C.inv}${S.editBuf}${C.noinv}` : S.editBuf}${C.cyan}_${C.reset}`);
   L.push('');
-  L.push(`  ${C.dim}${S.editBuf.length}/100${C.reset}`);
+  L.push(`  ${C.dim}${S.editBuf.length}/100${S.editFresh ? '   type to replace · Backspace or → to edit the current title' : ''}${C.reset}`);
   L.push('');
   L.push(keys(['Enter', 'save'], ['Esc', 'cancel']));
   render(L);
 }
+function startEdit(target, returnTo, initial) {
+  S.editTarget = target; S.editReturn = returnTo; S.editBuf = initial || ''; S.editFresh = !!initial;   // pre-filled text is "selected": typing replaces it
+  S.view = 'edit'; draw();
+}
 
-// Tickers: 1s for countdowns, 30s for the idle dashboard (uptime, quota reset)
-setInterval(() => { if (S.view === 'waiting') draw(); }, 1000);
-setInterval(() => { if (S.view === 'idle') draw(); }, 30000);
+// Tickers: 1s for countdowns, 30s for the idle dashboard (uptime, quota reset), ~15 fps for animations
+function startTickers() {
+  setInterval(() => { if (S.view === 'waiting') draw(); }, 1000);
+  setInterval(() => { if (S.view === 'idle') draw(); }, 30000);
+  setInterval(sweepTick, 66);
+}
 
 // ---------------------------------------------------------------------------
 // YouTube auth
 // ---------------------------------------------------------------------------
 let authClient = null;
+// youtube.upload only allows uploading + editing your own videos. Playlists and processing status need the full scope.
+const SCOPE_FULL = 'https://www.googleapis.com/auth/youtube';
+const hasFullScope = () => { const t = readToken(); return !!(t && t.scope && /auth\/youtube(\s|$)/.test(t.scope)); };
+const needsFullScope = () => !SIMULATE && (CFG.playlists || CFG.hdReadyToast) && !hasFullScope();
 
 function readToken() {
   const t = loadJson(TOKEN_FILE, null);
@@ -638,7 +748,7 @@ async function getAuth(force = false) {
     let client;
     server.listen(0, () => {
       client = makeClient(`http://localhost:${server.address().port}`);
-      const url = client.generateAuthUrl({ access_type: 'offline', prompt: 'consent', scope: ['https://www.googleapis.com/auth/youtube.upload'] });
+      const url = client.generateAuthUrl({ access_type: 'offline', prompt: 'consent', scope: [SCOPE_FULL] });
       log('Opening browser for Google sign-in');
       open(url);
     });
@@ -648,8 +758,16 @@ async function getAuth(force = false) {
 // ---------------------------------------------------------------------------
 // Upload
 // ---------------------------------------------------------------------------
+// True while another process (the recorder) still has the file open for writing. Writers normally open
+// with share-read only, so our own write-mode open fails with EBUSY/EPERM until they close it.
+function isLockedForWrite(filepath) {
+  try { fs.closeSync(fs.openSync(filepath, 'r+')); return false; }
+  catch (e) { return e.code === 'EBUSY' || e.code === 'EPERM' || e.code === 'EACCES'; }
+}
+
 function waitUntilStable(filepath) {
-  // Size must stay unchanged for two consecutive 3s checks (recorders write in bursts).
+  // Size must stay unchanged for two consecutive 3s checks (recorders write in bursts) AND nobody may
+  // still hold the file open for writing.
   return new Promise((resolve) => {
     let prev = -1, stableCount = 0;
     const tick = () => {
@@ -657,8 +775,9 @@ function waitUntilStable(filepath) {
       const size = fs.statSync(filepath).size;
       if (size === prev && size > 0) stableCount++; else stableCount = 0;
       prev = size;
-      if (stableCount >= 2) return resolve(true);
-      if (S.current) { S.current.status = `waiting for recording to finish… (${fmtBytes(size)})`; draw(); }
+      const locked = stableCount >= 2 && isLockedForWrite(filepath);
+      if (stableCount >= 2 && !locked) return resolve(true);
+      if (S.current) { S.current.status = locked ? `recorder still has the file open… (${fmtBytes(size)})` : `waiting for recording to finish… (${fmtBytes(size)})`; if (S.view === 'uploading') draw(); }
       setTimeout(tick, 3000);
     };
     tick();
@@ -703,6 +822,7 @@ async function uploadVideo(auth, filepath) {
 
   if (SIMULATE) {
     S.abort = new AbortController();
+    c.sentTitle = c.title; c.sentPrivacy = c.privacy;
     for (let i = 0; i <= 40; i++) {
       if (S.abort.signal.aborted) throw new Error('aborted');
       await new Promise(r => setTimeout(r, 120));
@@ -711,17 +831,23 @@ async function uploadVideo(auth, filepath) {
     return { videoId: 'SIM' + Math.random().toString(36).slice(2, 10), elapsed: ((Date.now() - startTime) / 1000).toFixed(0) };
   }
 
-  const youtube = google.youtube({ version: 'v3', auth });
+  // Resumable protocol: a dropped connection continues from the last byte YouTube confirmed, and the
+  // session file lets an upload survive an app restart (see resumable.js).
   S.abort = new AbortController();
-  const res = await youtube.videos.insert({
-    part: 'snippet,status',
-    requestBody: {
-      snippet: { title: c.title, description: `Gameplay clip · uploaded automatically by GameUploader`, tags: c.tags, categoryId: CFG.categoryId },
-      status: { privacyStatus: CFG.privacy, selfDeclaredMadeForKids: false },
+  c.sentTitle = c.title; c.sentPrivacy = c.privacy;   // edits made during the upload are applied afterwards
+  const res = await resumableUpload({
+    filepath,
+    metadata: {
+      snippet: { title: c.sentTitle, description: c.description, tags: c.tags, categoryId: CFG.categoryId },
+      status: { privacyStatus: c.sentPrivacy, selfDeclaredMadeForKids: false },
     },
-    media: { body: fs.createReadStream(filepath) },
-  }, { signal: S.abort.signal, onUploadProgress: evt => onProgress(evt.bytesRead) });
-  return { videoId: res.data.id, elapsed: ((Date.now() - startTime) / 1000).toFixed(0) };
+    getAuthHeaders: () => auth.getRequestHeaders(),
+    signal: S.abort.signal,
+    onProgress: (bytes) => onProgress(bytes),
+    sessionFile: path.join(SCRIPT_DIR, `upload-session${SIM}.json`),
+    log: (m) => log(`  [upload] ${m}`),
+  });
+  return { videoId: res.videoId, elapsed: ((Date.now() - startTime) / 1000).toFixed(0) };
 }
 
 // ---------------------------------------------------------------------------
@@ -767,9 +893,9 @@ async function processQueue() {
 
 async function handleFile(filepath) {
   const filename = path.basename(filepath);
-  const { title, game } = prettyTitle(path.parse(filename).name);
-  const tags = [...new Set([...(game ? [game.toLowerCase()] : []), ...CFG.tags])];
-  S.current = { filepath, filename, title, tags, sizeMB: 0, pct: 0, speed: 0, eta: 0, status: 'waiting for recording to finish…' };
+  const meta = buildMeta(filepath);
+  const { title, tags } = meta;
+  S.current = { filepath, ...meta, sizeMB: 0, pct: 0, speed: 0, eta: 0, status: 'waiting for recording to finish…' };
   S.cancelled = false;
   S.view = 'uploading';
   touch();
@@ -779,7 +905,7 @@ async function handleFile(filepath) {
 
   if (!(await waitUntilStable(filepath))) { log('File disappeared'); return 'next'; }
   const size = fs.statSync(filepath).size;
-  if (size < MIN_SIZE) { log('File too small, skipping'); markFile(filepath, 'skipped'); return 'next'; }
+  if (size < CFG.minSizeMB * 1048576) { log('File too small, skipping'); markFile(filepath, 'skipped'); return 'next'; }
   S.current.sizeMB = Math.round(size / 1048576);
   S.current.status = 'starting…';
 
@@ -797,9 +923,10 @@ async function handleFile(filepath) {
       const auth = await getAuth();
       log(`Uploading: ${title} (${S.current.sizeMB} MB)${attempt > 1 ? ` [attempt ${attempt}]` : ''}`);
       const result = await uploadVideo(auth, filepath);
+      const c = S.current;
       const url = `https://youtube.com/watch?v=${result.videoId}`;
       markFile(filepath, 'uploaded', { videoId: result.videoId });
-      const entry = { title, sizeMB: S.current.sizeMB, videoId: result.videoId, url, success: true, elapsed: result.elapsed, privacy: CFG.privacy, tags, filename };
+      const entry = { title: c.sentTitle, sizeMB: c.sizeMB, videoId: result.videoId, url, success: true, elapsed: result.elapsed, privacy: c.sentPrivacy, tags, filename, description: c.description, game: c.game };
       addHistory(entry);
       S.last = { ...entry, ts: Date.now() };
       S.notice = '';
@@ -807,8 +934,17 @@ async function handleFile(filepath) {
       copyToClipboard(url);
       beepSuccess();
       flashTaskbar();
-      toast('Uploaded · link copied', title, url);
-      S.view = 'done'; draw();
+      toast('Uploaded · link copied', c.title, url);
+      // If the user is mid-edit of this clip's title, keep the editor open but point it at the finished video.
+      if (S.view === 'edit' && S.editTarget === 'current') { S.editTarget = 'last'; S.editReturn = 'done'; }
+      else { S.view = 'done'; draw(); }
+      // Apply title/privacy changes made while the upload was running.
+      const patch = {};
+      if (c.title !== c.sentTitle) patch.title = c.title;
+      if (c.privacy !== c.sentPrivacy) patch.privacy = c.privacy;
+      if (Object.keys(patch).length) await updateVideo(patch);
+      if (c.playlist) await addToPlaylist(result.videoId, c.playlist);
+      watchProcessing(result.videoId, c.title, url);
       return 'next';
     } catch (e) {
       if (S.cancelled) {
@@ -869,6 +1005,84 @@ async function handleFile(filepath) {
 }
 
 // ---------------------------------------------------------------------------
+// Playlists (one per game) and processing status — both need SCOPE_FULL
+// ---------------------------------------------------------------------------
+const PLAYLISTS_FILE = path.join(SCRIPT_DIR, `playlists${SIM}.json`);
+
+async function ensurePlaylist(youtube, name) {
+  const cache = loadJson(PLAYLISTS_FILE, {});
+  if (cache[name]) return cache[name];
+  // Look through the channel's playlists first so we don't create duplicates.
+  let pageToken;
+  do {
+    const res = await youtube.playlists.list({ part: 'snippet', mine: true, maxResults: 50, pageToken });
+    const hit = (res.data.items || []).find(p => p.snippet.title.toLowerCase() === name.toLowerCase());
+    if (hit) { cache[name] = hit.id; saveJson(PLAYLISTS_FILE, cache); return hit.id; }
+    pageToken = res.data.nextPageToken;
+  } while (pageToken);
+  const created = await youtube.playlists.insert({
+    part: 'snippet,status',
+    requestBody: { snippet: { title: name, description: 'Gameplay clips · added automatically by GameUploader' }, status: { privacyStatus: 'unlisted' } },
+  });
+  cache[name] = created.data.id; saveJson(PLAYLISTS_FILE, cache);
+  log(`Created playlist "${name}" (${created.data.id})`);
+  return created.data.id;
+}
+
+async function addToPlaylist(videoId, name) {
+  if (SIMULATE) { S.notice = `Added to playlist "${name}"`; updateHistory(videoId, { playlist: name }); if (S.view === 'done') draw(); return; }
+  if (!hasFullScope()) { log('Playlist skipped: token lacks the full YouTube scope'); return; }
+  try {
+    const youtube = google.youtube({ version: 'v3', auth: await getAuth() });
+    const playlistId = await ensurePlaylist(youtube, name);
+    await youtube.playlistItems.insert({ part: 'snippet', requestBody: { snippet: { playlistId, resourceId: { kind: 'youtube#video', videoId } } } });
+    updateHistory(videoId, { playlist: name });
+    S.notice = `Added to playlist "${name}"`;
+    log(`Added ${videoId} to playlist "${name}"`);
+  } catch (e) {
+    const err = classifyError(e);
+    log(`Playlist failed: ${e.message}`);
+    S.notice = `${C.yellow}Couldn't add to playlist: ${err.message}${C.reset}`;
+  }
+  if (S.view === 'done') draw();
+}
+
+// Polls YouTube every 30s (1 quota unit each) until the clip is fully processed, then toasts. Max 40 polls (20 min).
+function watchProcessing(videoId, title, url) {
+  if (!CFG.hdReadyToast || S.polls.has(videoId)) return;
+  if (SIMULATE) { setTimeout(() => { S.notice = 'Ready to watch in full quality'; updateHistory(videoId, { hd: true }); if (S.view === 'done' || S.view === 'idle') draw(); }, 4000); return; }
+  if (!hasFullScope()) return;
+  S.polls.add(videoId);
+  let n = 0;
+  const poll = async () => {
+    try {
+      const youtube = google.youtube({ version: 'v3', auth: await getAuth() });
+      const res = await youtube.videos.list({ part: 'processingDetails,status', id: videoId });
+      const v = (res.data.items || [])[0];
+      const status = v && v.processingDetails && v.processingDetails.processingStatus;
+      if (status === 'succeeded') {
+        S.polls.delete(videoId);
+        updateHistory(videoId, { hd: true });
+        log(`Processing finished: ${videoId}`);
+        jingle('ready');
+        toast('Ready to watch in full quality', title, url);
+        S.notice = `Ready in full quality: ${clip(title, 40)}`;
+        if (S.view === 'done' || S.view === 'idle') draw();
+        return;
+      }
+      if (status === 'failed' || status === 'terminated') {
+        S.polls.delete(videoId);
+        log(`Processing ${status}: ${videoId} ${v.processingDetails.processingFailureReason || ''}`);
+        toast('YouTube could not process the clip', title, url);
+        return;
+      }
+    } catch (e) { log(`Processing poll failed: ${e.message}`); }
+    if (++n < 40) setTimeout(poll, 30000); else S.polls.delete(videoId);
+  };
+  setTimeout(poll, 20000);
+}
+
+// ---------------------------------------------------------------------------
 // Post-upload edits (title / privacy) via the YouTube API
 // ---------------------------------------------------------------------------
 async function updateVideo(patch) {
@@ -879,7 +1093,7 @@ async function updateVideo(patch) {
     if (!SIMULATE) {
       const youtube = google.youtube({ version: 'v3', auth: await getAuth() });
       if (patch.title !== undefined) {
-        await youtube.videos.update({ part: 'snippet', requestBody: { id: h.videoId, snippet: { title: patch.title, categoryId: CFG.categoryId, tags: h.tags, description: 'Gameplay clip · uploaded automatically by GameUploader' } } });
+        await youtube.videos.update({ part: 'snippet', requestBody: { id: h.videoId, snippet: { title: patch.title, categoryId: CFG.categoryId, tags: h.tags, description: h.description || buildMeta(path.join(CFG.watchDir, h.filename || h.title)).description } } });
       }
       if (patch.privacy !== undefined) {
         await youtube.videos.update({ part: 'status', requestBody: { id: h.videoId, status: { privacyStatus: patch.privacy, selfDeclaredMadeForKids: false } } });
@@ -905,6 +1119,7 @@ function goIdle(minimize = false) {
   if (minimize) minimizeSelf();
 }
 
+function initKeyboard() {
 readline.emitKeypressEvents(process.stdin);
 if (process.stdin.isTTY) process.stdin.setRawMode(true);
 process.stdin.resume();
@@ -915,21 +1130,47 @@ process.stdin.on('keypress', (str, k = {}) => {
   const ch = (str || '').toLowerCase();
   const name = k.name || '';
 
+  // Help is reachable from every screen except the text editor.
+  if (S.view === 'help') { if (name === 'escape' || ch === '?' || ch === 'q') { S.view = S.helpReturn; draw(); } return; }
+  if (ch === '?' && S.view !== 'edit') { S.helpReturn = S.view; S.view = 'help'; draw(); return; }
+
   switch (S.view) {
-    case 'edit':
-      if (name === 'return') { const t = S.editBuf.trim(); S.view = 'done'; if (t && t !== S.last.title) updateVideo({ title: t.slice(0, 100) }); else draw(); }
-      else if (name === 'escape') { S.view = 'done'; draw(); }
-      else if (name === 'backspace') { S.editBuf = S.editBuf.slice(0, -1); draw(); }
-      else if (str && !k.ctrl && !k.meta && str >= ' ' && S.editBuf.length < 100) { S.editBuf += str; draw(); }
+    case 'edit': {
+      const back = S.editReturn || 'done';
+      if (name === 'return') {
+        const t = S.editBuf.trim().slice(0, 100);
+        S.view = back;
+        if (S.editTarget === 'current' && S.current) { if (t) { S.current.title = t; S.notice = 'Title will be applied when the upload finishes'; } draw(); }
+        else if (t && t !== S.last.title) updateVideo({ title: t });
+        else draw();
+      }
+      else if (name === 'escape') { S.view = back; draw(); }
+      else if (name === 'backspace') { if (S.editFresh) S.editFresh = false; else S.editBuf = S.editBuf.slice(0, -1); draw(); }
+      else if (name === 'right' || name === 'end') { S.editFresh = false; draw(); }
+      else if (str && !k.ctrl && !k.meta && str >= ' ') {
+        if (S.editFresh) { S.editBuf = ''; S.editFresh = false; }
+        if (S.editBuf.length < 100) S.editBuf += str;
+        draw();
+      }
       return;
+    }
 
     case 'history': {
       const history = loadJson(HISTORY_FILE);
       const h = history[S.histCursor];
+      if (S.histConfirm !== null) {
+        if (ch === 'y' && h) {
+          const p = historyFilePath(h);
+          if (p) { try { const s = fs.statSync(p).size; fs.unlinkSync(p); log(`Deleted: ${path.basename(p)}`); S.notice = `Deleted ${path.basename(p)} (${fmtBytes(s)})`; } catch (e) { log(`Delete failed: ${e.message}`); } }
+        }
+        S.histConfirm = null; draw();
+        return;
+      }
       if (name === 'up') { S.histCursor--; draw(); }
       else if (name === 'down') { S.histCursor++; draw(); }
       else if (name === 'return' && h && h.url) openInBrowser(h.url);
       else if (ch === 'c' && h && h.url) { copyToClipboard(h.url); }
+      else if (ch === 'x' && h && historyFilePath(h)) { S.histConfirm = S.histCursor; draw(); }
       else if (name === 'escape' || ch === 'h') goIdle();
       else if (ch === 'q') goIdle(true);
       return;
@@ -948,7 +1189,9 @@ process.stdin.on('keypress', (str, k = {}) => {
       return;
 
     case 'uploading':
-      if (ch === 'x' && S.abort) { S.cancelled = true; S.abort.abort(); }
+      if (ch === 't' && S.current) startEdit('current', 'uploading', S.current.title);
+      else if (ch === 'p' && S.current) { const order = ['unlisted', 'public', 'private']; S.current.privacy = order[(order.indexOf(S.current.privacy) + 1) % order.length]; draw(); }
+      else if (ch === 'x' && S.abort) { S.cancelled = true; S.abort.abort(); }
       else if (ch === 's' && S.queue.length) { const f = S.queue.shift(); markFile(f, 'skipped'); log(`Skipped: ${path.basename(f)}`); draw(); }
       else if (ch === 'q') minimizeSelf();
       return;
@@ -967,7 +1210,8 @@ process.stdin.on('keypress', (str, k = {}) => {
       return;
 
     case 'done':
-      if (ch === 't') { S.editBuf = S.last.title; S.view = 'edit'; draw(); }
+      if (ch === 't') startEdit('last', 'done', S.last.title);
+      else if (ch === 'l' && S.last.videoId) openInBrowser(studioUrl(S.last.videoId));
       else if (ch === 'p') { const order = ['unlisted', 'public', 'private']; const cur = S.last.privacy || CFG.privacy; updateVideo({ privacy: order[(order.indexOf(cur) + 1) % order.length] }); }
       else if (ch === 'c') { copyToClipboard(S.last.url); S.notice = 'Link copied'; draw(); }
       else if (ch === 'o') openInBrowser(S.last.url);
@@ -978,8 +1222,14 @@ process.stdin.on('keypress', (str, k = {}) => {
 
     case 'idle': {
       const last = S.last || lastUpload();
+      if (last && !S.last) S.last = last;
       if (ch === 'c' && last) { copyToClipboard(last.url); S.notice = 'Link copied'; draw(); }
       else if (ch === 'o' && last) openInBrowser(last.url);
+      else if (ch === 'l' && last && last.videoId) openInBrowser(studioUrl(last.videoId));
+      else if (ch === 'f') openFolder(CFG.watchDir);
+      else if (ch === 'a' && needsFullScope()) { S.notice = 'Opening Google sign-in in your browser…'; draw(); getAuth(true).then(() => { S.notice = 'Signed in — playlists and HD-ready alerts enabled'; draw(); }).catch(e => { S.notice = `${C.red}Sign-in failed: ${e.message}${C.reset}`; draw(); }); }
+      else if (ch === 't' && last) startEdit('last', 'idle', last.title);
+      else if (ch === 'p' && last) { const order = ['unlisted', 'public', 'private']; const cur = last.privacy || CFG.privacy; updateVideo({ privacy: order[(order.indexOf(cur) + 1) % order.length] }); }
       else if (ch === 'h') { S.histCursor = 0; S.view = 'history'; draw(); }
       else if (ch === 'd') { S.view = 'delete'; draw(); }
       else if (ch === 'r') restart();
@@ -988,10 +1238,12 @@ process.stdin.on('keypress', (str, k = {}) => {
     }
   }
 });
+}
 
 function restart() {
   log('Restarting...');
   leaveScreen();
+  if (process.env.GAMEUPLOADER_LOOP) process.exit(3);   // run.bat restarts us
   spawn(process.argv[0], process.argv.slice(1), { cwd: process.cwd(), detached: false, stdio: 'inherit', shell: true });
   process.exit(0);
 }
@@ -1013,27 +1265,52 @@ async function main() {
   process.title = WIN_TITLE;
   initWindowHelper();
   ensureToastIdentity();
-  if (!fs.existsSync(WATCH_DIR)) fs.mkdirSync(WATCH_DIR, { recursive: true });
 
-  log(`Watching: ${WATCH_DIR} (v${VERSION})`);
+  log(`Watching: ${CFG.watchDir} (v${VERSION})`);
   enterScreen();
+  initKeyboard();
+  startTickers();
   draw();
   setTimeout(() => { if (!CFG.popupOnUpload || S.view === 'idle') minimizeSelf(); }, 2000);
 
   autoClean();
   setInterval(autoClean, 60 * 60 * 1000);
-
-  // Watch the folder. ignoreInitial:false also picks up clips dropped while the app was closed
-  // (already-uploaded / skipped ones are filtered by uploaded.json).
-  const watcher = chokidar.watch(WATCH_DIR, { ignoreInitial: false, depth: 0, awaitWriteFinish: false, usePolling: false });
-  watcher.on('add', (filepath) => {
-    if (CFG.extensions.includes(path.extname(filepath).toLowerCase())) enqueueFile(filepath);
-  });
-  watcher.on('error', (err) => log(`Watcher error: ${err.message}`));
+  startWatcher();
+  watchConfig();
 
   process.on('uncaughtException', (e) => log(`Uncaught: ${e.stack || e.message}`));
   process.on('unhandledRejection', (e) => log(`Unhandled: ${(e && e.stack) || e}`));
 }
 
+// Watch the folder. ignoreInitial:false also picks up clips dropped while the app was closed
+// (already-uploaded / skipped ones are filtered by uploaded.json).
+let watcher = null;
+function startWatcher() {
+  if (watcher) { watcher.close().catch(() => {}); watcher = null; }
+  if (!fs.existsSync(CFG.watchDir)) { try { fs.mkdirSync(CFG.watchDir, { recursive: true }); } catch (e) { log(`Can't create watch folder: ${e.message}`); } }
+  watcher = chokidar.watch(CFG.watchDir, { ignoreInitial: false, depth: 0, awaitWriteFinish: false, usePolling: false });
+  watcher.on('add', (filepath) => {
+    if (CFG.extensions.includes(path.extname(filepath).toLowerCase())) enqueueFile(filepath);
+  });
+  watcher.on('error', (err) => log(`Watcher error: ${err.message}`));
+}
+
+// Reload config.json when it changes on disk — no restart needed.
+function watchConfig() {
+  if (argValue('--config')) return;
+  fs.watchFile(CONFIG_FILE, { interval: 2000 }, () => {
+    const { cfg, error } = loadConfig();
+    if (error) { S.notice = `${C.red}config.json has an error: ${clip(error, 45)}${C.reset}`; log(`Config reload failed: ${error}`); }
+    else {
+      const dirChanged = cfg.watchDir !== CFG.watchDir;
+      Object.assign(CFG, cfg);
+      if (dirChanged) { startWatcher(); log(`Watch folder changed: ${CFG.watchDir}`); }
+      S.notice = 'Settings reloaded';
+      log('Config reloaded');
+    }
+    if (S.view === 'idle') draw();
+  });
+}
+
 if (require.main === module) main();
-else module.exports = { prettyTitle, pacificMidnight, classifyError, readToken, fmtBytes, fmtDuration, toast, CFG };
+else module.exports = { prettyTitle, buildMeta, pacificMidnight, classifyError, readToken, fmtBytes, fmtDuration, toast, isLockedForWrite, loadConfig, CFG };
