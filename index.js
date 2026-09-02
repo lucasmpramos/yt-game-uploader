@@ -263,10 +263,55 @@ function render(lines) {
 }
 function setTitle(t) { process.title = `${WIN_TITLE} - ${t}`; }
 
+// --- Logo: "GAME" (figlet Elite) over "UPLOADER" (figlet ANSI Shadow), "Arcade" palette ---
+const LOGO_GAME = [
+  ' ▄▄ •  ▄▄▄· • ▌ ▄ ·. ▄▄▄ .',
+  '▐█ ▀ ▪▐█ ▀█ ·██ ▐███▪▀▄.▀·',
+  '▄█ ▀█▄▄█▀▀█ ▐█ ▌▐▌▐█·▐▀▀▪▄',
+  '▐█▄▪▐█▐█ ▪▐▌██ ██▌▐█▌▐█▄▄▌',
+  '·▀▀▀▀  ▀  ▀ ▀▀  █▪▀▀▀ ▀▀▀',
+];
+const LOGO_UP = [
+  '██╗   ██╗██████╗ ██╗      ██████╗  █████╗ ██████╗ ███████╗██████╗',
+  '██║   ██║██╔══██╗██║     ██╔═══██╗██╔══██╗██╔══██╗██╔════╝██╔══██╗',
+  '██║   ██║██████╔╝██║     ██║   ██║███████║██║  ██║█████╗  ██████╔╝',
+  '██║   ██║██╔═══╝ ██║     ██║   ██║██╔══██║██║  ██║██╔══╝  ██╔══██╗',
+  '╚██████╔╝██║     ███████╗╚██████╔╝██║  ██║██████╔╝███████╗██║  ██║',
+  ' ╚═════╝ ╚═╝     ╚══════╝ ╚═════╝ ╚═╝  ╚═╝╚═════╝ ╚══════╝╚═╝  ╚═╝',
+];
+const PAL = { game: [212, 83, 126], stops: [[29, 158, 117], [45, 150, 170], [55, 138, 221]], shadow: 0.55 };
+const LOGO_W = Math.max(...LOGO_UP.map(l => l.length));
+const rgb = (c) => `\x1b[38;2;${Math.round(c[0])};${Math.round(c[1])};${Math.round(c[2])}m`;
+function grad(t) {
+  const s = PAL.stops, n = s.length - 1, i = Math.min(n - 1, Math.floor(t * n)), f = t * n - i, a = s[i], b = s[i + 1];
+  return [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f, a[2] + (b[2] - a[2]) * f];
+}
+// Colors a line left→right along the gradient; box-drawing "shadow" glyphs get a darker shade.
+function gradientLine(line, width) {
+  let out = '', last = '';
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === ' ') { out += ' '; continue; }
+    let c = grad(i / Math.max(1, width - 1));
+    if ('╗╔╚╝║═'.includes(ch)) c = c.map(v => v * PAL.shadow);
+    const code = rgb(c);
+    if (code !== last) { out += code; last = code; }
+    out += ch;
+  }
+  return out + C.reset;
+}
+const wordmark = () => `${rgb(PAL.game)}${C.bold}GAME${C.reset} ${C.bold}${gradientLine('UPLOADER', 8)}`;
+
 const startedAt = Date.now();
-function header() {
-  const right = `${C.dim}up ${fmtDuration((Date.now() - startedAt) / 1000)} · v${VERSION}${SIMULATE ? ' · SIMULATION' : ''}${C.reset}`;
-  return ['', lr(`  ${C.cyan}${C.bold}GAME UPLOADER${C.reset}`, right), ''];
+function header(full = false) {
+  const right = `${C.dim}v${VERSION} · up ${fmtDuration((Date.now() - startedAt) / 1000)}${SIMULATE ? ' · SIMULATION' : ''}${C.reset}`;
+  if (!full) return ['', lr(`  ${wordmark()}`, right), ''];
+  const L = [''];
+  for (const l of LOGO_GAME) L.push(`  ${rgb(PAL.game)}${l}${C.reset}`);
+  for (const l of LOGO_UP) L.push(`  ${gradientLine(l, LOGO_W)}`);
+  L.push(lr('', right));
+  L.push('');
+  return L;
 }
 
 // ---------------------------------------------------------------------------
@@ -316,7 +361,7 @@ function queueLines(startNum = 1) {
 
 function drawIdle() {
   setTitle('Watching');
-  const L = header();
+  const L = header(true);
   const exts = CFG.extensions.map(e => e.slice(1)).join(' · ');
   L.push(lr(`  ${C.green}●${C.reset} Watching ${C.dim}${clip(WATCH_DIR, 40)}${C.reset}`, `${C.dim}${exts}${C.reset}`));
   L.push('');
@@ -369,7 +414,7 @@ function drawUploading() {
 function drawDone() {
   setTitle('Done');
   const h = S.last;
-  const L = header();
+  const L = header(true);
   L.push(lr(`  ${C.green}${C.bold}✓ Uploaded${C.reset}   ${clip(h.title, 38)}`, `${C.dim}${fmtBytes(h.sizeMB * 1048576)} · ${h.elapsed}s${C.reset}`));
   L.push(lr(`  ${C.cyan}${h.url.replace('https://', '')}${C.reset}`, `${C.green}link copied${C.reset}`));
   L.push('');
