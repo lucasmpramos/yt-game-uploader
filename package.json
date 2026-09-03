@@ -1,10 +1,12 @@
 {
   "name": "gameuploader",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "Watches a folder and auto-uploads gameplay clips to YouTube",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
+    "daemon": "node index.js --daemon",
+    "ui": "node index.js --ui",
     "auth": "node index.js --auth",
     "demo": "node index.js --simulate",
     "test": "node --test"

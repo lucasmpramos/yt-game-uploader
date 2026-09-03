@@ -15,9 +15,18 @@ Record gameplay → Clip saved to folder → Detected → Uploaded → Toast + l
 3. When done: Windows toast notification, YouTube link copied to your clipboard, taskbar flash
 4. It stays minimized the whole time — it never steals focus from your game
 
+## How it runs
+
+Two processes:
+
+- **Background process** (`node index.js --daemon`) — the watcher, the uploads, the tray icon, all the state. No window. Started hidden by `daemon.vbs`, kept alive by `run.bat` (restarts after a crash or `R`).
+- **Terminal UI** (`node index.js --ui`) — the screens. A viewer: it renders the background process's state and forwards your keys to it over a local pipe. Close it, reopen it from the tray, open two of them — the app doesn't care. If no background process is running, the UI runs standalone instead (that's what `npm start` does too).
+
+`start.bat` starts the background process (which opens the UI); if it is already running, it just opens the window.
+
 ## Tray mode
 
-The app lives in the system tray. The terminal window is hidden until you want it:
+The app lives in the system tray. The terminal window is there when you want it:
 
 - **Left-click** the icon (a pixel `▲` — cyan while watching, pink while uploading, red on error, gray when paused) to show or hide the window. `Q` hides it again.
 - **Hover** for status: "watching · 2 of 6 today · last: …" or "Uploading 61% · 22s left".
@@ -26,7 +35,7 @@ The app lives in the system tray. The terminal window is hidden until you want i
 
 The tray icon is a ~10 KB helper (`tray.cs`) compiled on first run by the C# compiler that ships with Windows — no downloads, no third-party binaries. Without it (`tray: false` or no compiler) the app falls back to minimizing to the taskbar.
 
-Closing the terminal window with ✕ still quits the app (Windows Terminal doesn't let us intercept that) — use `Q` or the tray's Quit.
+Closing the terminal window with ✕ only closes the window — the background process and the tray icon stay. Quit from the tray menu (or Ctrl+C in the window) stops everything.
 
 ## Screens
 
@@ -134,7 +143,7 @@ Changes to `config.json` are picked up live — no restart needed.
 
 ### 5. Auto-start with Windows (optional)
 
-Tick **Start with Windows** in the tray menu — it installs a launcher in `shell:startup`. (Manual alternative: copy `start.bat` there with absolute paths.) The launcher opens `run.bat` in its own Windows Terminal window, which keeps the app alive: crashes restart it after 5 s, and `R` restarts it instantly.
+Tick **Start with Windows** in the tray menu — it installs a launcher in `shell:startup` that runs `daemon.vbs` (the hidden background process). Crashes restart it after 5 s, `R` restarts it instantly; open UI windows reconnect by themselves.
 
 ## Demo mode
 
@@ -155,10 +164,11 @@ Unit tests for title parsing, templates and overrides, file-lock detection (with
 ## Files
 
 ```
-index.js          The app (UI, queue, YouTube calls)
+index.js          The app: --daemon (background), --ui (terminal screens), or standalone
 resumable.js      Resumable upload protocol
 tray.cs / tray.js Tray icon + window control helper (compiled to tray.exe on first run)
-run.bat           Keeps the app running (auto-restart); start.bat opens it in Windows Terminal
+daemon.vbs        Starts the background process hidden; start.bat calls it
+run.bat           Keeps a process running (auto-restart)
 config.json       Your settings (created on first run, reloaded live)
 client_secret.json  Google OAuth client (you provide)
 token.json        Your sign-in token (created by npm run auth)

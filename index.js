@@ -1,5 +1,6 @@
 const fs = require('fs');
 const os = require('os');
+const net = require('net');
 const path = require('path');
 const http = require('http');
 const readline = require('readline');
@@ -12,6 +13,15 @@ const { startTray } = require('./tray');
 const VERSION = require('./package.json').version;
 const SIMULATE = process.argv.includes('--simulate');   // fake uploads, separate data files
 const argValue = (flag) => { const i = process.argv.indexOf(flag); return i > -1 ? process.argv[i + 1] : undefined; };
+
+// Process model:
+//   --daemon     background process: watcher, uploads, tray icon, all state. No window. Publishes state over a pipe.
+//   --ui         the terminal screens: a viewer that renders the daemon's state and forwards keys. Close/reopen freely.
+//   (no flag)    standalone: both in one process (old behaviour; also the fallback when no daemon is running).
+const MODE = process.argv.includes('--daemon') ? 'daemon' : process.argv.includes('--ui') ? 'ui' : 'standalone';
+const IS_DAEMON = MODE === 'daemon';
+let IS_UI = MODE === 'ui';   // flips to false if no daemon answers and the window runs standalone instead
+const PIPE = `\\\\.\\pipe\\GameUploader${SIMULATE ? '-sim' : ''}`;
 
 // ---------------------------------------------------------------------------
 // Config
@@ -270,18 +280,19 @@ function scheduleAutoHide() {
   if (!trayOn() || !CFG.autoHideAfter) return;
   autoHideTimer = setTimeout(() => { autoHideTimer = null; if (S.busy || S.view === 'edit') scheduleAutoHide(); else hideSelf(); }, CFG.autoHideAfter * 1000);
 }
-function hideSelf() { cancelAutoHide(); if (trayOn()) tray.send('hide'); else minimizeSelf(); }
+function hideSelf() { cancelAutoHide(); if (IS_DAEMON && !uiAttached()) return; if (trayOn()) tray.send('hide'); else minimizeSelf(); }
 // Show the window without taking focus from the game; hides again after autoHideAfter.
-function showQuiet() { if (trayOn()) { tray.send('shownoactivate'); scheduleAutoHide(); } else flashTaskbar(); }
-// User asked for the window (tray click): show and focus.
-function showFocus() { cancelAutoHide(); if (trayOn()) tray.send('show'); else restoreSelf(); }
+// With no UI window open at all we don't create one (a brand-new window would take focus) — the toast covers it.
+function showQuiet() { if (IS_DAEMON && !uiAttached()) return; if (trayOn()) { tray.send('shownoactivate'); scheduleAutoHide(); } else flashTaskbar(); }
+// User asked for the window (tray click): show and focus — or open a new one if it was closed.
+function showFocus() { cancelAutoHide(); if (IS_DAEMON && !uiAttached()) { spawnUi(); return; } if (trayOn()) tray.send('show'); else restoreSelf(); }
 
 const STARTUP_BAT = path.join(process.env.APPDATA || '', 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', `${WIN_TITLE}.bat`);
 const autostartEnabled = () => !!process.env.APPDATA && fs.existsSync(STARTUP_BAT);
 function setAutostart(on) {
   if (!process.env.APPDATA) return;
   try {
-    if (on) fs.writeFileSync(STARTUP_BAT, `@echo off\r\nrem Auto-start GameUploader with Windows (written by GameUploader).\r\nstart "" wt.exe -w ${WIN_TITLE} -d "${SCRIPT_DIR}" --title ${WIN_TITLE} cmd.exe /c "${path.join(SCRIPT_DIR, 'run.bat')}"\r\n`);
+    if (on) fs.writeFileSync(STARTUP_BAT, `@echo off\r\nrem Auto-start GameUploader with Windows (written by GameUploader). Starts the hidden background process.\r\nwscript.exe "${path.join(SCRIPT_DIR, 'daemon.vbs')}"\r\n`);
     else if (fs.existsSync(STARTUP_BAT)) fs.unlinkSync(STARTUP_BAT);
     log(`Start with Windows: ${on ? 'on' : 'off'}`);
   } catch (e) { log(`Autostart change failed: ${e.message}`); }
@@ -311,7 +322,7 @@ function onTrayEvent(line) {
   if (ev !== 'ready') log(`Tray: ${line}`);
   switch (ev) {
     case 'ready': tray.send(`menu-autostart ${autostartEnabled() ? 1 : 0}`); tray.send(`menu-pause ${S.paused ? 1 : 0}`); lastTrayState = ''; updateTray(); break;
-    case 'click': cancelAutoHide(); tray.send('toggle'); break;
+    case 'click': cancelAutoHide(); if (IS_DAEMON && !uiAttached()) spawnUi(); else tray.send('toggle'); break;
     case 'show': showFocus(); break;
     case 'copy': if (last) { copyToClipboard(last.url); toast('Link copied', last.title); } break;
     case 'open': if (last) openInBrowser(last.url); break;
@@ -443,6 +454,7 @@ const SWEEP_ROW0 = 7;        // header(): row 1 blank, rows 2–6 GAME, rows 7�
 let lastActivity = Date.now();
 const touch = () => { lastActivity = Date.now(); };
 function sweepTick() {
+  if (IS_UI && !S.connected) return;
   if (S.view === 'uploading' && S.current && S.current.sizeMB) {
     out.write(`\x1b[${BAR_ROW};1H${barLine(S.current.pct)}\x1b[K`);   // shimmer along the bar
     return;
@@ -456,7 +468,7 @@ function sweepTick() {
 }
 const wordmark = () => `${rgb(PAL.game)}${C.bold}GAME${C.reset} ${C.bold}${gradientLine('UPLOADER', 8)}`;
 
-const startedAt = Date.now();
+let startedAt = Date.now();   // in UI mode: the daemon's start time (from its state)
 function header(full = false) {
   const right = `${C.dim}v${VERSION} · up ${fmtDuration((Date.now() - startedAt) / 1000)}${SIMULATE ? ' · SIMULATION' : ''}${C.reset}`;
   if (!full) return ['', lr(`  ${wordmark()}`, right), ''];
@@ -489,9 +501,114 @@ const S = {
   helpReturn: 'idle',
   polls: new Set(),      // videoIds being polled for processing status
   paused: false,         // "Pause watching" from the tray menu
+  connected: false,      // UI mode: connected to the daemon
+  trayRemote: false,     // UI mode: the daemon has a tray icon
 };
 
+// ---------------------------------------------------------------------------
+// Daemon ⇄ UI pipe: the daemon publishes state on every draw(), the UI renders it and sends keys back
+// ---------------------------------------------------------------------------
+const STATE_FIELDS = ['view', 'queue', 'current', 'last', 'error', 'waitUntil', 'waitReason', 'waitFile', 'histCursor', 'histConfirm',
+  'editBuf', 'editFresh', 'editTarget', 'editReturn', 'notice', 'paused', 'busy', 'helpReturn'];
+const uiClients = new Set();
+let uiEverAttached = false;
+
+function snapshot() {
+  const s = {};
+  for (const k of STATE_FIELDS) s[k] = S[k];
+  return { type: 'state', S: s, cfg: CFG, startedAt, version: VERSION, tray: trayOn() };
+}
+function publishState(sock) {
+  if (!uiClients.size) return;
+  const msg = JSON.stringify(snapshot()) + '\n';
+  for (const c of (sock ? [sock] : uiClients)) { try { c.write(msg); } catch {} }
+}
+function broadcast(obj) { const msg = JSON.stringify(obj) + '\n'; for (const c of uiClients) { try { c.write(msg); } catch {} } }
+
+function startIpcServer(onAlreadyRunning) {
+  const server = net.createServer((sock) => {
+    uiClients.add(sock);
+    sock.setEncoding('utf8');
+    let buf = '';
+    sock.on('data', (d) => {
+      buf += d;
+      let i;
+      while ((i = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, i); buf = buf.slice(i + 1);
+        let msg; try { msg = JSON.parse(line); } catch { continue; }
+        if (msg.type === 'key') handleKey(msg.str, msg.key || {});
+        else if (msg.type === 'hello') publishState(sock);
+      }
+    });
+    sock.on('close', () => { uiClients.delete(sock); log(`UI window detached (${uiClients.size} left)`); });
+    sock.on('error', () => {});
+    log(`UI window attached (${uiClients.size})`);
+    publishState(sock);
+    if (!uiEverAttached) { uiEverAttached = true; setTimeout(() => { if (S.view === 'idle') hideSelf(); }, 2000); }
+  });
+  server.on('error', (e) => {
+    if (e.code === 'EADDRINUSE') onAlreadyRunning();
+    else { log(`IPC server error: ${e.message}`); process.exit(1); }
+  });
+  server.listen(PIPE);
+  return server;
+}
+
+// Opens the terminal UI in its own Windows Terminal window (or brings the existing one back).
+function spawnUi() {
+  if (process.env.GAMEUPLOADER_NO_UI) return;
+  const args = ['/c', 'start', '', 'wt.exe', '-w', WIN_TITLE, '-d', SCRIPT_DIR, '--title', WIN_TITLE, 'node', 'index.js', '--ui'];
+  if (SIMULATE) args.push('--simulate');
+  if (argValue('--config')) args.push('--config', argValue('--config'));
+  try { spawn('cmd.exe', args, { detached: true, stdio: 'ignore', windowsHide: true }).unref(); log('Opening UI window'); }
+  catch (e) { log(`Could not open UI window: ${e.message}`); }
+}
+const uiAttached = () => uiClients.size > 0;
+
+// UI side
+let uiSock = null;
+function startUiClient() {
+  let retries = 0;
+  const connect = () => {
+    const sock = net.createConnection(PIPE);
+    sock.setEncoding('utf8');
+    let buf = '';
+    sock.on('connect', () => { uiSock = sock; retries = 0; S.connected = true; sock.write(JSON.stringify({ type: 'hello' }) + '\n'); });
+    sock.on('data', (d) => {
+      buf += d;
+      let i;
+      while ((i = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, i); buf = buf.slice(i + 1);
+        let msg; try { msg = JSON.parse(line); } catch { continue; }
+        if (msg.type === 'state') { Object.assign(S, msg.S); Object.assign(CFG, msg.cfg); startedAt = msg.startedAt; S.trayRemote = !!msg.tray; S.connected = true; draw(); }
+        else if (msg.type === 'quit') { leaveScreen(); process.exit(0); }
+      }
+    });
+    const lost = () => {
+      if (uiSock === sock) uiSock = null;
+      if (S.connected) { S.connected = false; draw(); }
+      // Not running at all on first try → become the app ourselves (start.bat double-clicked without the daemon).
+      if (retries === 0 && !uiEverConnected) { runStandaloneFallback(); return; }
+      retries++;
+      setTimeout(connect, Math.min(5000, 500 * retries));
+    };
+    let uiEverConnected = false;
+    sock.once('connect', () => { uiEverConnected = true; });
+    sock.on('error', lost);
+    sock.on('close', () => { if (uiEverConnected) lost(); });
+  };
+  connect();
+}
+function uiSendKey(str, key) {
+  if (!uiSock) return;
+  try { uiSock.write(JSON.stringify({ type: 'key', str, key: { name: key.name, ctrl: key.ctrl, meta: key.meta, shift: key.shift } }) + '\n'); } catch {}
+}
+let standaloneFallback = null;   // set by main()
+function runStandaloneFallback() { if (standaloneFallback) standaloneFallback(); }
+
 function draw() {
+  if (IS_DAEMON) { publishState(); updateTray(); return; }   // the UI process does the drawing
+  if (IS_UI && !S.connected) { drawDisconnected(); return; }
   switch (S.view) {
     case 'help': drawHelp(); break;
     case 'idle': drawIdle(); break;
@@ -505,7 +622,19 @@ function draw() {
   }
   updateTray();
 }
-const hideLabel = () => (trayOn() ? 'hide to tray' : 'minimize');
+const hideLabel = () => ((IS_UI ? S.trayRemote : trayOn()) ? 'hide to tray' : 'minimize');
+
+function drawDisconnected() {
+  setTitle('Connecting');
+  const L = header();
+  L.push(`  ${C.yellow}⟳${C.reset} Connecting to the GameUploader background process…`);
+  L.push('');
+  L.push(`  ${C.dim}It restarts by itself after ${cap('R')} or a crash; this window reconnects automatically.${C.reset}`);
+  L.push(`  ${C.dim}If it never comes back: run start.bat.${C.reset}`);
+  L.push('');
+  L.push(keys(['Ctrl+C', 'close this window']));
+  render(L);
+}
 
 // Lists the pending queue as a section. startNum=2 while something is uploading (that one is #1).
 function queueLines(startNum = 1) {
@@ -749,8 +878,8 @@ function startEdit(target, returnTo, initial) {
 
 // Tickers: 1s for countdowns, 30s for the idle dashboard (uptime, quota reset), ~15 fps for animations
 function startTickers() {
-  setInterval(() => { if (S.view === 'waiting') draw(); }, 1000);
-  setInterval(() => { if (S.view === 'idle') draw(); }, 30000);
+  setInterval(() => { if (S.view === 'waiting' && (!IS_UI || S.connected)) draw(); }, 1000);
+  setInterval(() => { if (S.view === 'idle' && (!IS_UI || S.connected)) draw(); }, 30000);
   setInterval(sweepTick, 66);
 }
 
@@ -1192,11 +1321,19 @@ function goIdle(minimize = false) {
 }
 
 function initKeyboard() {
-readline.emitKeypressEvents(process.stdin);
-if (process.stdin.isTTY) process.stdin.setRawMode(true);
-process.stdin.resume();
+  readline.emitKeypressEvents(process.stdin);
+  if (process.stdin.isTTY) process.stdin.setRawMode(true);
+  process.stdin.resume();
+  process.stdin.on('keypress', (str, k = {}) => {
+    touch();
+    if (IS_UI) {
+      if (!S.connected && k.ctrl && k.name === 'c') { leaveScreen(); process.exit(0); }
+      uiSendKey(str, k);
+    } else handleKey(str, k);
+  });
+}
 
-process.stdin.on('keypress', (str, k = {}) => {
+function handleKey(str, k = {}) {
   touch();
   cancelAutoHide();   // the user is at the window: don't yank it away
   if (k.ctrl && k.name === 'c') { shutdown(); return; }
@@ -1310,17 +1447,21 @@ process.stdin.on('keypress', (str, k = {}) => {
       return;
     }
   }
-});
 }
 
 function restart() {
   log('Restarting...');
-  leaveScreen();
-  if (process.env.GAMEUPLOADER_LOOP) process.exit(3);   // run.bat restarts us
+  if (!IS_DAEMON) leaveScreen();
+  if (process.env.GAMEUPLOADER_LOOP) process.exit(3);   // run.bat restarts us; UI windows reconnect
   spawn(process.argv[0], process.argv.slice(1), { cwd: process.cwd(), detached: false, stdio: 'inherit', shell: true });
   process.exit(0);
 }
-function shutdown(reason = 'Ctrl+C') { log(`Quit (${reason})`); if (tray) tray.stop(); leaveScreen(); setTimeout(() => process.exit(0), 150); }
+function shutdown(reason = 'Ctrl+C') {
+  log(`Quit (${reason})`);
+  if (tray) tray.stop();
+  if (IS_DAEMON) broadcast({ type: 'quit' }); else leaveScreen();
+  setTimeout(() => process.exit(0), 250);
+}
 process.on('exit', () => { try { leaveScreen(); } catch {} });
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
@@ -1335,25 +1476,53 @@ async function main() {
     process.exit(0);
   }
 
-  process.title = WIN_TITLE;
-  initWindowHelper();
-  ensureToastIdentity();
+  process.on('uncaughtException', (e) => log(`Uncaught: ${e.stack || e.message}`));
+  process.on('unhandledRejection', (e) => log(`Unhandled: ${(e && e.stack) || e}`));
 
-  log(`Watching: ${CFG.watchDir} (v${VERSION})`);
-  if (CFG.tray && !SIMULATE) tray = startTray({ dir: SCRIPT_DIR, title: WIN_TITLE, tooltip: `${WIN_TITLE} · starting`, onEvent: onTrayEvent, log });
+  if (IS_UI) {
+    // Viewer only: render the daemon's state, forward keys. Falls back to standalone if no daemon answers.
+    process.title = WIN_TITLE;
+    standaloneFallback = () => { log('No background process found — running standalone in this window'); IS_UI = false; S.connected = true; runCore(); };
+    enterScreen();
+    initKeyboard();
+    startTickers();
+    draw();
+    startUiClient();
+    return;
+  }
+  if (IS_DAEMON) {
+    process.title = 'gu-daemon';   // must NOT contain the window title: the tray helper finds the UI window by title
+    startIpcServer(() => {
+      log('Background process already running — opening its window instead');
+      spawnUi();
+      setTimeout(() => process.exit(0), 500);
+    });
+    log(`Background process started (v${VERSION}) · pipe ${PIPE}`);
+    runCore();
+    spawnUi();
+    return;
+  }
+  process.title = WIN_TITLE;
   enterScreen();
   initKeyboard();
   startTickers();
-  draw();
+  runCore();
   setTimeout(() => { if (S.view === 'idle') hideSelf(); }, 2000);
+}
 
+// Everything that makes the app tick (daemon and standalone modes): window helper, tray, watcher, config, clean-up.
+function runCore() {
+  initWindowHelper();
+  ensureToastIdentity();
+  log(`Watching: ${CFG.watchDir} (v${VERSION}, ${MODE})`);
+  if (CFG.tray && !SIMULATE) tray = startTray({ dir: SCRIPT_DIR, title: WIN_TITLE, tooltip: `${WIN_TITLE} · starting`, onEvent: onTrayEvent, log });
+  draw();
   autoClean();
   setInterval(autoClean, 60 * 60 * 1000);
   startWatcher();
   watchConfig();
-
-  process.on('uncaughtException', (e) => log(`Uncaught: ${e.stack || e.message}`));
-  process.on('unhandledRejection', (e) => log(`Unhandled: ${(e && e.stack) || e}`));
+  setInterval(() => { if (IS_DAEMON && S.view === 'idle') publishState(); }, 30000);
+  setInterval(() => { if (IS_DAEMON && S.view === 'waiting') publishState(); }, 1000);
 }
 
 // Watch the folder. ignoreInitial:false also picks up clips dropped while the app was closed
