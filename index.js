@@ -386,6 +386,7 @@ function ensureToastIdentity() {
   const target = fs.existsSync(trayExe) ? trayExe : path.join(SCRIPT_DIR, 'start.bat');
   try {
     if (fs.existsSync(START_MENU_LNK) && (!fs.existsSync(trayExe) || fs.statSync(START_MENU_LNK).mtimeMs >= fs.statSync(trayExe).mtimeMs)) return;
+    try { if (fs.existsSync(START_MENU_LNK)) fs.unlinkSync(START_MENU_LNK); } catch {}   // snoretoast won't overwrite an existing shortcut
     execFile(snore, ['-install', WIN_TITLE, target, WIN_TITLE], { windowsHide: true }, () => log('Registered toast identity (Start Menu shortcut → tray.exe icon)'));
   } catch {}
 }
