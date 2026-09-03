@@ -386,7 +386,9 @@ const xmlEsc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').repla
 function toast(title, message, url) {
   if (!CFG.toast) return;
   const launch = url ? ` launch="${xmlEsc(url)}" activationType="protocol"` : '';
-  const xml = `<toast${launch}><visual><binding template="ToastGeneric"><text>${xmlEsc(title)}</text><text>${xmlEsc(message)}</text></binding></visual></toast>`;
+  const iconPng = path.join(SCRIPT_DIR, 'icon.png');   // exported from the tray helper's artwork (256 px)
+  const img = fs.existsSync(iconPng) ? `<image placement="appLogoOverride" src="file:///${xmlEsc(iconPng.replace(/\\/g, '/'))}"/>` : '';
+  const xml = `<toast${launch}><visual><binding template="ToastGeneric">${img}<text>${xmlEsc(title)}</text><text>${xmlEsc(message)}</text></binding></visual></toast>`;
   const script = [
     '[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null',
     '[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null',
@@ -1531,12 +1533,23 @@ async function main() {
   setTimeout(() => { if (S.view === 'idle') hideSelf(); }, 2000);
 }
 
+// icon.png (256 px, for toasts) and icon.ico are exported from the tray helper's artwork whenever the helper is rebuilt.
+function ensureIconAssets() {
+  const exe = path.join(SCRIPT_DIR, 'tray.exe'), png = path.join(SCRIPT_DIR, 'icon.png'), ico = path.join(SCRIPT_DIR, 'icon.ico');
+  try {
+    if (!fs.existsSync(exe)) return;
+    if (fs.existsSync(png) && fs.statSync(png).mtimeMs >= fs.statSync(exe).mtimeMs) return;
+    execFile(exe, ['--export-icon', png, ico], { windowsHide: true, timeout: 20000 }, (e) => log(e ? `Icon export failed: ${e.message}` : 'Icon assets exported (icon.png, icon.ico)'));
+  } catch (e) { log(`Icon export failed: ${e.message}`); }
+}
+
 // Everything that makes the app tick (daemon and standalone modes): window helper, tray, watcher, config, clean-up.
 function runCore() {
   initWindowHelper();
   ensureToastIdentity();
   log(`Watching: ${CFG.watchDir} (v${VERSION}, ${MODE})`);
   if (CFG.tray && !SIMULATE) tray = startTray({ dir: SCRIPT_DIR, title: WIN_TITLE, tooltip: `${WIN_TITLE} · starting`, onEvent: onTrayEvent, log });
+  ensureIconAssets();
   draw();
   autoClean();
   setInterval(autoClean, 60 * 60 * 1000);

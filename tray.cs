@@ -45,7 +45,7 @@ class Tray : ApplicationContext
     // Palette (matches the terminal logo)
     static readonly Color IDLE = Color.FromArgb(212, 83, 126), BUSY = Color.FromArgb(64, 192, 112),
                           ERR = Color.FromArgb(226, 75, 74), PAUSED = Color.FromArgb(136, 135, 128),
-                          TILE_DARK = Color.FromArgb(38, 38, 42);
+                          TILE_DARK = Color.FromArgb(0, 0, 0);
 
     readonly string windowTitle;
     readonly NotifyIcon icon;
@@ -124,9 +124,9 @@ class Tray : ApplicationContext
         return ic;
     }
 
-    static Icon BuildIcon(Color c, int pct)
+    static Icon BuildIcon(Color c, int pct, int[] sizes = null)
     {
-        int[] sizes = { 16, 20, 24, 32 };
+        if (sizes == null) sizes = new[] { 16, 20, 24, 32 };
         var pngs = new List<byte[]>();
         foreach (var s in sizes) pngs.Add(RenderPng(s, c, pct));
         // Assemble a .ico (PNG entries) so Windows picks the right size for the current DPI.
@@ -172,20 +172,22 @@ class Tray : ApplicationContext
                     using (var b = new SolidBrush(c)) g.FillRectangle(b, 0, size - h, size, h);
                     g.Clip = old;
                 }
-                // white ▲: a stepped pyramid so it stays crisp at 16 px
+                // Pixel-art "upload" glyph (arrow over a base line) on a 6x7 grid, scaled by whole pixels so it
+                // stays crisp at every size: 2 px cells at 16, 4 px at 32, 32 px at 256.
                 g.SmoothingMode = SmoothingMode.None;
+                string[] grid = { "..##..", ".####.", "######", "..##..", "..##..", "......", "######" };
+                int cell = Math.Max(1, size / 8);
+                int ox = (size - 6 * cell) / 2, oy = (size - 7 * cell) / 2;
+                using (var sh = new SolidBrush(Color.FromArgb(80, 0, 0, 0)))
                 using (var wb = new SolidBrush(Color.White))
                 {
-                    int unit = Math.Max(1, size / 8);           // 2 px at 16, 4 px at 32
-                    int cx = size / 2, baseY = size - unit * 2 - (size >= 24 ? 1 : 0);
-                    int rows = 3;
-                    for (int i = 0; i < rows; i++)
-                    {
-                        int half = unit * (i + 1);
-                        int y = baseY - (rows - 1 - i) * unit;
-                        g.FillRectangle(wb, cx - half, y - unit, half * 2, unit);
-                    }
-                    g.FillRectangle(wb, cx - unit / 2 - (unit % 2 == 0 ? 0 : 0), baseY - rows * unit - unit, unit, unit);
+                    for (int pass = 0; pass < 2; pass++)
+                        for (int y = 0; y < 7; y++) for (int x = 0; x < 6; x++)
+                            if (grid[y][x] == '#')
+                            {
+                                if (pass == 0 && size >= 24) g.FillRectangle(sh, ox + x * cell + cell / 2, oy + y * cell + cell / 2, cell, cell);   // soft drop shadow (bigger sizes only)
+                                if (pass == 1) g.FillRectangle(wb, ox + x * cell, oy + y * cell, cell, cell);
+                            }
                 }
             }
             using (var ms = new MemoryStream()) { bmp.Save(ms, ImageFormat.Png); return ms.ToArray(); }
@@ -372,6 +374,13 @@ class Tray : ApplicationContext
     [STAThread]
     static void Main(string[] args)
     {
+        if (args.Length > 2 && args[0] == "--export-icon")
+        {   // tray.exe --export-icon <png> <ico>: a 256 px PNG (used in toasts) and a multi-size .ico of the idle icon
+            File.WriteAllBytes(args[1], RenderPng(256, IDLE, -1));
+            using (var ic = BuildIcon(IDLE, -1, new[] { 16, 24, 32, 48, 64, 128, 256 }))
+            using (var fs = File.Create(args[2])) ic.Save(fs);
+            return;
+        }
         if (args.Length > 1 && args[0] == "--preview")
         {   // tray.exe --preview <dir>: write the icon variants as PNGs (for checking the artwork)
             Directory.CreateDirectory(args[1]);

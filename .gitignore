@@ -12,3 +12,5 @@ upload-session.json
 *.log
 _winctl.ps1
 tray.exe
+icon.png
+icon.ico
