@@ -7,6 +7,7 @@ const { spawn, execFile } = require('child_process');
 const { google } = require('googleapis');
 const chokidar = require('chokidar');
 const { resumableUpload } = require('./resumable');
+const { startTray } = require('./tray');
 
 const VERSION = require('./package.json').version;
 const SIMULATE = process.argv.includes('--simulate');   // fake uploads, separate data files
@@ -32,6 +33,9 @@ const DEFAULT_CONFIG = {
   tags: ['gameplay'],
   categoryId: '20',
   popupOnUpload: false,
+  tray: true,             // tray icon; the window hides to the tray instead of minimizing
+  showAfterUpload: true,  // bring the window back (without stealing focus) when an upload finishes
+  autoHideAfter: 120,     // seconds until an auto-shown window hides again (0 = never); any key cancels
   toast: true,
   sounds: true,
   clipboard: true,
@@ -256,6 +260,69 @@ const minimizeSelf = () => winctl('minimize');
 const restoreSelf = () => winctl('restore');
 const flashTaskbar = () => winctl('flash');
 
+// --- Tray mode: the window hides to a tray icon instead of minimizing; tray.exe also does the window control ---
+let tray = null;
+let autoHideTimer = null;
+const trayOn = () => !!(tray && tray.alive);
+function cancelAutoHide() { if (autoHideTimer) { clearTimeout(autoHideTimer); autoHideTimer = null; } }
+function scheduleAutoHide() {
+  cancelAutoHide();
+  if (!trayOn() || !CFG.autoHideAfter) return;
+  autoHideTimer = setTimeout(() => { autoHideTimer = null; if (S.busy || S.view === 'edit') scheduleAutoHide(); else hideSelf(); }, CFG.autoHideAfter * 1000);
+}
+function hideSelf() { cancelAutoHide(); if (trayOn()) tray.send('hide'); else minimizeSelf(); }
+// Show the window without taking focus from the game; hides again after autoHideAfter.
+function showQuiet() { if (trayOn()) { tray.send('shownoactivate'); scheduleAutoHide(); } else flashTaskbar(); }
+// User asked for the window (tray click): show and focus.
+function showFocus() { cancelAutoHide(); if (trayOn()) tray.send('show'); else restoreSelf(); }
+
+const STARTUP_BAT = path.join(process.env.APPDATA || '', 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', `${WIN_TITLE}.bat`);
+const autostartEnabled = () => !!process.env.APPDATA && fs.existsSync(STARTUP_BAT);
+function setAutostart(on) {
+  if (!process.env.APPDATA) return;
+  try {
+    if (on) fs.writeFileSync(STARTUP_BAT, `@echo off\r\nrem Auto-start GameUploader with Windows (written by GameUploader).\r\nstart "" wt.exe -w ${WIN_TITLE} -d "${SCRIPT_DIR}" --title ${WIN_TITLE} cmd.exe /c "${path.join(SCRIPT_DIR, 'run.bat')}"\r\n`);
+    else if (fs.existsSync(STARTUP_BAT)) fs.unlinkSync(STARTUP_BAT);
+    log(`Start with Windows: ${on ? 'on' : 'off'}`);
+  } catch (e) { log(`Autostart change failed: ${e.message}`); }
+  if (trayOn()) tray.send(`menu-autostart ${autostartEnabled() ? 1 : 0}`);
+}
+
+let lastTrayState = '';
+function updateTray() {
+  if (!trayOn()) return;
+  let tip, icon = 'idle';
+  const q = S.queue.length ? ` · ${S.queue.length} in queue` : '';
+  if (S.paused) { tip = `${WIN_TITLE} · paused${q}`; icon = 'paused'; }
+  else if (S.view === 'uploading' && S.current) { tip = S.current.sizeMB ? `Uploading ${S.current.pct}% · ${fmtDuration(S.current.eta)} left${q}` : `Waiting for recording to finish${q}`; icon = 'busy'; }
+  else if (S.view === 'error' && S.error) { tip = `Upload failed: ${S.error.message}`; icon = 'error'; }
+  else if (S.view === 'waiting') { tip = `Paused: ${S.waitReason}${q}`; icon = 'paused'; }
+  else { const last = S.last || lastUpload(); tip = `${WIN_TITLE} · watching · ${uploadsToday()} of ${CFG.dailyUploadLimit} today${last ? ` · last: ${last.title}` : ''}`; }
+  const state = `${icon}|${tip}`;
+  if (state === lastTrayState) return;
+  lastTrayState = state;
+  tray.send(`icon ${icon}`);
+  tray.send(`tooltip ${tip.replace(/[\r\n]+/g, ' ')}`);
+}
+
+function onTrayEvent(line) {
+  const [ev, arg] = line.split(' ');
+  const last = S.last || lastUpload();
+  if (ev !== 'ready') log(`Tray: ${line}`);
+  switch (ev) {
+    case 'ready': tray.send(`menu-autostart ${autostartEnabled() ? 1 : 0}`); tray.send(`menu-pause ${S.paused ? 1 : 0}`); lastTrayState = ''; updateTray(); break;
+    case 'click': cancelAutoHide(); tray.send('toggle'); break;
+    case 'show': showFocus(); break;
+    case 'copy': if (last) { copyToClipboard(last.url); toast('Link copied', last.title); } break;
+    case 'open': if (last) openInBrowser(last.url); break;
+    case 'folder': openFolder(CFG.watchDir); break;
+    case 'pause': S.paused = true; S.notice = 'Paused — new clips are ignored until you resume'; tray.send('menu-pause 1'); log('Paused watching'); if (S.view === 'idle') draw(); lastTrayState = ''; updateTray(); break;
+    case 'resume': S.paused = false; S.notice = ''; tray.send('menu-pause 0'); log('Resumed watching'); startWatcher(); if (S.view === 'idle') draw(); lastTrayState = ''; updateTray(); break;
+    case 'autostart': setAutostart(arg === '1'); break;
+    case 'quit': shutdown('tray menu'); break;
+  }
+}
+
 // Retro console-speaker jingles (frequency Hz, duration ms).
 const JINGLES = {
   success: [[523, 90], [659, 90], [784, 90], [1047, 200]],        // C E G C — "level up"
@@ -421,21 +488,24 @@ const S = {
   authNeeded: false,
   helpReturn: 'idle',
   polls: new Set(),      // videoIds being polled for processing status
+  paused: false,         // "Pause watching" from the tray menu
 };
 
 function draw() {
   switch (S.view) {
-    case 'help': return drawHelp();
-    case 'idle': return drawIdle();
-    case 'uploading': return drawUploading();
-    case 'done': return drawDone();
-    case 'error': return drawError();
-    case 'waiting': return drawWaiting();
-    case 'history': return drawHistory();
-    case 'delete': return drawDelete();
-    case 'edit': return drawEdit();
+    case 'help': drawHelp(); break;
+    case 'idle': drawIdle(); break;
+    case 'uploading': drawUploading(); break;
+    case 'done': drawDone(); break;
+    case 'error': drawError(); break;
+    case 'waiting': drawWaiting(); break;
+    case 'history': drawHistory(); break;
+    case 'delete': drawDelete(); break;
+    case 'edit': drawEdit(); break;
   }
+  updateTray();
 }
+const hideLabel = () => (trayOn() ? 'hide to tray' : 'minimize');
 
 // Lists the pending queue as a section. startNum=2 while something is uploading (that one is #1).
 function queueLines(startNum = 1) {
@@ -465,7 +535,8 @@ function drawIdle() {
   setTitle('Watching');
   const L = header(true);
   const exts = CFG.extensions.map(e => e.slice(1)).join('  ');
-  L.push(lr(`  ${C.green}●${C.reset} Watching ${C.bold}${clip(shortPath(CFG.watchDir), 40)}${C.reset}`, `${C.dim}${exts}${C.reset}`));
+  if (S.paused) L.push(lr(`  ${C.yellow}⏸${C.reset} Paused — not watching ${C.dim}${clip(shortPath(CFG.watchDir), 36)}${C.reset}`, `${C.dim}resume from the tray icon${C.reset}`));
+  else L.push(lr(`  ${C.green}●${C.reset} Watching ${C.bold}${clip(shortPath(CFG.watchDir), 40)}${C.reset}`, `${C.dim}${exts}${C.reset}`));
   L.push('');
   L.push(rule('Last upload'));
   const last = S.last || lastUpload();
@@ -493,7 +564,7 @@ function drawIdle() {
   if (last) L.push(keys(['C', 'copy link'], ['O', 'open'], ['L', 'studio'], ['T', 'edit title'], ['P', `privacy: ${last.privacy || CFG.privacy}`]));
   const k = [['H', 'history'], ['F', 'folder']];
   if (onDisk.length) k.push(['D', 'clean up']);
-  k.push(['?', 'help'], ['R', 'restart'], ['Q', 'minimize']);
+  k.push(['?', 'help'], ['R', 'restart'], ['Q', hideLabel()]);
   L.push(keys(...k));
   render(L);
 }
@@ -535,7 +606,7 @@ function drawUploading() {
   L.push('');
   const k = [['T', 'edit title'], ['P', `privacy: ${c.privacy}`], ['X', 'cancel']];
   if (S.queue.length) k.push(['S', 'skip next']);
-  k.push(['Q', 'minimize']);
+  k.push(['Q', hideLabel()]);
   L.push(keys(...k));
   render(L);
 }
@@ -551,7 +622,7 @@ function drawDone() {
   if (S.notice) { L.push(''); L.push(`  ${C.green}${S.notice}${C.reset}`); }
   L.push(...queueLines());
   L.push('');
-  L.push(keys(['T', 'edit title'], ['P', 'privacy'], ['C', 'copy'], ['O', 'open'], ['Q', 'minimize']));
+  L.push(keys(['T', 'edit title'], ['P', 'privacy'], ['C', 'copy'], ['O', 'open'], ['L', 'studio'], ['Q', hideLabel()]));
   render(L);
 }
 
@@ -568,7 +639,7 @@ function drawError() {
   const k = [];
   if (e.kind === 'auth') k.push(['A', 'sign in again']);
   else k.push(['Enter', 'retry now']);
-  k.push(['Esc', 'give up'], ['Q', 'minimize']);
+  k.push(['Esc', 'give up'], ['Q', hideLabel()]);
   L.push(keys(...k));
   render(L);
 }
@@ -583,7 +654,7 @@ function drawWaiting() {
   if (S.waitFile) L.push(`  ${C.dim}Next: ${clip(path.basename(S.waitFile), 50)}${C.reset}`);
   L.push(...queueLines());
   L.push('');
-  L.push(keys(['Enter', 'retry now'], ['Esc', 'give up on this clip'], ['Q', 'minimize']));
+  L.push(keys(['Enter', 'retry now'], ['Esc', 'give up on this clip'], ['Q', hideLabel()]));
   render(L);
 }
 
@@ -854,6 +925,7 @@ async function uploadVideo(auth, filepath) {
 // Queue
 // ---------------------------------------------------------------------------
 function enqueueFile(filepath) {
+  if (S.paused) { log(`Ignored while paused: ${path.basename(filepath)}`); return; }
   if (isKnownFile(filepath) || S.queue.includes(filepath) || (S.current && S.current.filepath === filepath)) return;
   S.queue.push(filepath);
   log(`Queued: ${path.basename(filepath)} (${S.queue.length} in queue)`);
@@ -900,7 +972,7 @@ async function handleFile(filepath) {
   S.view = 'uploading';
   touch();
   log(`New video detected: ${filename}`);
-  if (CFG.popupOnUpload) restoreSelf(); else flashTaskbar();
+  if (CFG.popupOnUpload) showQuiet(); else if (!trayOn()) flashTaskbar();
   draw();
 
   if (!(await waitUntilStable(filepath))) { log('File disappeared'); return 'next'; }
@@ -933,7 +1005,7 @@ async function handleFile(filepath) {
       log(`Uploaded! ${url} (${result.elapsed}s)`);
       copyToClipboard(url);
       beepSuccess();
-      flashTaskbar();
+      if (CFG.showAfterUpload) showQuiet(); else flashTaskbar();
       toast('Uploaded · link copied', c.title, url);
       // If the user is mid-edit of this clip's title, keep the editor open but point it at the finished video.
       if (S.view === 'edit' && S.editTarget === 'current') { S.editTarget = 'last'; S.editReturn = 'done'; }
@@ -982,7 +1054,7 @@ async function handleFile(filepath) {
       // Show the error and wait for the user: Enter = retry, A = re-auth, Esc = give up
       S.error = { ...err, filename, filepath };
       S.view = 'error';
-      beepError(); flashTaskbar();
+      beepError(); showQuiet();
       toast('Upload failed', `${err.message} — ${filename}`);
       draw();
       const k = await waitForKey();
@@ -1116,7 +1188,7 @@ async function updateVideo(patch) {
 function goIdle(minimize = false) {
   S.view = 'idle';
   draw();
-  if (minimize) minimizeSelf();
+  if (minimize) hideSelf();
 }
 
 function initKeyboard() {
@@ -1126,6 +1198,7 @@ process.stdin.resume();
 
 process.stdin.on('keypress', (str, k = {}) => {
   touch();
+  cancelAutoHide();   // the user is at the window: don't yank it away
   if (k.ctrl && k.name === 'c') { shutdown(); return; }
   const ch = (str || '').toLowerCase();
   const name = k.name || '';
@@ -1193,20 +1266,20 @@ process.stdin.on('keypress', (str, k = {}) => {
       else if (ch === 'p' && S.current) { const order = ['unlisted', 'public', 'private']; S.current.privacy = order[(order.indexOf(S.current.privacy) + 1) % order.length]; draw(); }
       else if (ch === 'x' && S.abort) { S.cancelled = true; S.abort.abort(); }
       else if (ch === 's' && S.queue.length) { const f = S.queue.shift(); markFile(f, 'skipped'); log(`Skipped: ${path.basename(f)}`); draw(); }
-      else if (ch === 'q') minimizeSelf();
+      else if (ch === 'q') hideSelf();
       return;
 
     case 'waiting':
       if (name === 'return' && S.resumeWait) S.resumeWait(false);
       else if (name === 'escape' && S.resumeWait) S.resumeWait(true);
-      else if (ch === 'q') minimizeSelf();
+      else if (ch === 'q') hideSelf();
       return;
 
     case 'error':
       if (name === 'return' && S.resumeError) S.resumeError('retry');
       else if (ch === 'a' && S.resumeError) S.resumeError('auth');
       else if (name === 'escape' && S.resumeError) S.resumeError('giveup');
-      else if (ch === 'q') minimizeSelf();
+      else if (ch === 'q') hideSelf();
       return;
 
     case 'done':
@@ -1247,7 +1320,7 @@ function restart() {
   spawn(process.argv[0], process.argv.slice(1), { cwd: process.cwd(), detached: false, stdio: 'inherit', shell: true });
   process.exit(0);
 }
-function shutdown() { leaveScreen(); process.exit(0); }
+function shutdown(reason = 'Ctrl+C') { log(`Quit (${reason})`); if (tray) tray.stop(); leaveScreen(); setTimeout(() => process.exit(0), 150); }
 process.on('exit', () => { try { leaveScreen(); } catch {} });
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
@@ -1267,11 +1340,12 @@ async function main() {
   ensureToastIdentity();
 
   log(`Watching: ${CFG.watchDir} (v${VERSION})`);
+  if (CFG.tray && !SIMULATE) tray = startTray({ dir: SCRIPT_DIR, title: WIN_TITLE, tooltip: `${WIN_TITLE} · starting`, onEvent: onTrayEvent, log });
   enterScreen();
   initKeyboard();
   startTickers();
   draw();
-  setTimeout(() => { if (!CFG.popupOnUpload || S.view === 'idle') minimizeSelf(); }, 2000);
+  setTimeout(() => { if (S.view === 'idle') hideSelf(); }, 2000);
 
   autoClean();
   setInterval(autoClean, 60 * 60 * 1000);

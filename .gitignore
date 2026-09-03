@@ -11,3 +11,4 @@ upload-session.json
 *.sim.json
 *.log
 _winctl.ps1
+tray.exe

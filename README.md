@@ -15,6 +15,19 @@ Record gameplay → Clip saved to folder → Detected → Uploaded → Toast + l
 3. When done: Windows toast notification, YouTube link copied to your clipboard, taskbar flash
 4. It stays minimized the whole time — it never steals focus from your game
 
+## Tray mode
+
+The app lives in the system tray. The terminal window is hidden until you want it:
+
+- **Left-click** the icon (a pixel `▲` — cyan while watching, pink while uploading, red on error, gray when paused) to show or hide the window. `Q` hides it again.
+- **Hover** for status: "watching · 2 of 6 today · last: …" or "Uploading 61% · 22s left".
+- **Right-click**: Show window · Copy last link · Open last clip · Open watch folder · Pause watching · Start with Windows · Quit.
+- When an upload finishes (or fails) the window **appears without taking focus** — your game keeps keyboard and mouse — and hides itself again after 2 minutes unless you press a key in it (`showAfterUpload`, `autoHideAfter`).
+
+The tray icon is a ~10 KB helper (`tray.cs`) compiled on first run by the C# compiler that ships with Windows — no downloads, no third-party binaries. Without it (`tray: false` or no compiler) the app falls back to minimizing to the taskbar.
+
+Closing the terminal window with ✕ still quits the app (Windows Terminal doesn't let us intercept that) — use `Q` or the tray's Quit.
+
 ## Screens
 
 **Idle** — a small dashboard: last upload with its link, how many of today's uploads you've used, how many already-uploaded clips are still on disk.
@@ -101,7 +114,10 @@ On first run a `config.json` is created with defaults you can edit:
 | `extensions` | `[".mp4", ".mkv", ".mov"]` | File types to upload |
 | `privacy` | `"unlisted"` | `unlisted`, `public`, or `private` |
 | `tags` | `["gameplay"]` | Tags added to every upload (game name is added automatically) |
-| `popupOnUpload` | `false` | Bring the window to front when a clip is detected |
+| `tray` | `true` | Tray icon; the window hides to the tray instead of minimizing |
+| `showAfterUpload` | `true` | Show the window (without stealing focus) when an upload finishes or fails |
+| `autoHideAfter` | `120` | Seconds until an auto-shown window hides again (0 = never); any key cancels |
+| `popupOnUpload` | `false` | Also show the window when a clip is *detected* |
 | `toast` / `sounds` / `clipboard` | `true` | Notification toggles |
 | `deleteAfterDays` | `7` | Auto-delete uploaded clips from disk after N days (0 = never) |
 | `dailyUploadLimit` | `6` | Your YouTube API daily upload allowance |
@@ -118,7 +134,7 @@ Changes to `config.json` are picked up live — no restart needed.
 
 ### 5. Auto-start with Windows (optional)
 
-Copy `start.bat` into `shell:startup` (Win+R → `shell:startup`). It opens `run.bat` in a Windows Terminal tab, which keeps the app alive: crashes restart it after 5 s, and `R` restarts it instantly.
+Tick **Start with Windows** in the tray menu — it installs a launcher in `shell:startup`. (Manual alternative: copy `start.bat` there with absolute paths.) The launcher opens `run.bat` in its own Windows Terminal window, which keeps the app alive: crashes restart it after 5 s, and `R` restarts it instantly.
 
 ## Demo mode
 
@@ -141,6 +157,7 @@ Unit tests for title parsing, templates and overrides, file-lock detection (with
 ```
 index.js          The app (UI, queue, YouTube calls)
 resumable.js      Resumable upload protocol
+tray.cs / tray.js Tray icon + window control helper (compiled to tray.exe on first run)
 run.bat           Keeps the app running (auto-restart); start.bat opens it in Windows Terminal
 config.json       Your settings (created on first run, reloaded live)
 client_secret.json  Google OAuth client (you provide)
