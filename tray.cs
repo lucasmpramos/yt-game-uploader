@@ -43,7 +43,7 @@ class Tray : ApplicationContext
     const uint SWP_NOSIZE = 1, SWP_NOMOVE = 2, SWP_NOACTIVATE = 0x10, SWP_SHOWWINDOW = 0x40;
 
     // Palette (matches the terminal logo)
-    static readonly Color IDLE = Color.FromArgb(45, 150, 170), BUSY = Color.FromArgb(212, 83, 126),
+    static readonly Color IDLE = Color.FromArgb(212, 83, 126), BUSY = Color.FromArgb(64, 192, 112),
                           ERR = Color.FromArgb(226, 75, 74), PAUSED = Color.FromArgb(136, 135, 128),
                           TILE_DARK = Color.FromArgb(38, 38, 42);
 
