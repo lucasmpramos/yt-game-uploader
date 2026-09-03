@@ -375,6 +375,7 @@ const studioUrl = videoId => `https://studio.youtube.com/video/${videoId}/edit`;
 // Windows toasts via the native WinRT API (through Windows PowerShell). Clicking the toast opens `url`.
 // Desktop apps need a Start Menu shortcut carrying an AppUserModelID for toasts to show; SnoreToast's
 // -install (vendored with node-notifier) creates it once.
+const TOAST_AUMID = 'Lucas.GameUploader';   // notification identity; changed from 'GameUploader' to escape Windows' cached generic icon
 const START_MENU_LNK = path.join(process.env.APPDATA || '', 'Microsoft', 'Windows', 'Start Menu', 'Programs', `${WIN_TITLE}.lnk`);
 function ensureToastIdentity() {
   if (!CFG.toast || !process.env.APPDATA) return;
@@ -387,7 +388,7 @@ function ensureToastIdentity() {
   try {
     if (fs.existsSync(START_MENU_LNK) && (!fs.existsSync(trayExe) || fs.statSync(START_MENU_LNK).mtimeMs >= fs.statSync(trayExe).mtimeMs)) return;
     try { if (fs.existsSync(START_MENU_LNK)) fs.unlinkSync(START_MENU_LNK); } catch {}   // snoretoast won't overwrite an existing shortcut
-    execFile(snore, ['-install', WIN_TITLE, target, WIN_TITLE], { windowsHide: true }, () => log('Registered toast identity (Start Menu shortcut → tray.exe icon)'));
+    execFile(snore, ['-install', WIN_TITLE, target, TOAST_AUMID], { windowsHide: true }, () => log('Registered toast identity (Start Menu shortcut → tray.exe icon)'));
   } catch {}
 }
 const xmlEsc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -402,7 +403,7 @@ function toast(title, message, url) {
     '[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null',
     '$x = New-Object Windows.Data.Xml.Dom.XmlDocument',
     `$x.LoadXml('${xml.replace(/'/g, "''")}')`,
-    `[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('${WIN_TITLE}').Show((New-Object Windows.UI.Notifications.ToastNotification $x))`,
+    `[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('${TOAST_AUMID}').Show((New-Object Windows.UI.Notifications.ToastNotification $x))`,
   ].join('\n');
   ps(['-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')]);
 }
