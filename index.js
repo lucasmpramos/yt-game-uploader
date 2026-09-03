@@ -299,21 +299,40 @@ function setAutostart(on) {
   if (trayOn()) tray.send(`menu-autostart ${autostartEnabled() ? 1 : 0}`);
 }
 
-let lastTrayState = '';
+let lastTrayState = '', lastRecentKey = '';
 function updateTray() {
   if (!trayOn()) return;
-  let tip, icon = 'idle';
+  let tip, status, icon = 'idle';
   const q = S.queue.length ? ` · ${S.queue.length} in queue` : '';
-  if (S.paused) { tip = `${WIN_TITLE} · paused${q}`; icon = 'paused'; }
-  else if (S.view === 'uploading' && S.current) { tip = S.current.sizeMB ? `Uploading ${S.current.pct}% · ${fmtDuration(S.current.eta)} left${q}` : `Waiting for recording to finish${q}`; icon = 'busy'; }
-  else if (S.view === 'error' && S.error) { tip = `Upload failed: ${S.error.message}`; icon = 'error'; }
-  else if (S.view === 'waiting') { tip = `Paused: ${S.waitReason}${q}`; icon = 'paused'; }
-  else { const last = S.last || lastUpload(); tip = `${WIN_TITLE} · watching · ${uploadsToday()} of ${CFG.dailyUploadLimit} today${last ? ` · last: ${last.title}` : ''}`; }
-  const state = `${icon}|${tip}`;
-  if (state === lastTrayState) return;
-  lastTrayState = state;
-  tray.send(`icon ${icon}`);
-  tray.send(`tooltip ${tip.replace(/[\r\n]+/g, ' ')}`);
+  const c = S.current;
+  if (S.paused) { tip = `${WIN_TITLE} · paused${q}`; status = 'Paused — not watching'; icon = 'paused'; }
+  else if (S.view === 'uploading' && c) {
+    if (c.sizeMB) { tip = `Uploading ${c.pct}% · ${fmtDuration(c.eta)} left${q}`; status = `Uploading ${c.pct}% · ${clip(c.title, 32)}`; icon = `busy ${c.pct}`; }
+    else { tip = `Waiting for recording to finish${q}`; status = 'Waiting for the recording to finish'; icon = 'busy 0'; }
+  }
+  else if (S.view === 'error' && S.error) { tip = `Upload failed: ${S.error.message}`; status = `Failed: ${clip(S.error.message, 40)}`; icon = 'error'; }
+  else if (S.view === 'waiting') { tip = `Paused: ${S.waitReason}${q}`; status = clip(S.waitReason, 50); icon = 'paused'; }
+  else {
+    const last = S.last || lastUpload();
+    const today = uploadsToday();
+    tip = `${WIN_TITLE} · watching · ${today} of ${CFG.dailyUploadLimit} today${last ? ` · last: ${last.title}` : ''}`;
+    status = `Watching · ${today} of ${CFG.dailyUploadLimit} uploads today${q}`;
+  }
+  const state = `${icon}|${tip}|${status}`;
+  if (state !== lastTrayState) {
+    lastTrayState = state;
+    tray.send(`icon ${icon}`);
+    tray.send(`tooltip ${tip.replace(/[\r\n]+/g, ' ')}`);
+    tray.send(`status ${status.replace(/[\r\n]+/g, ' ')}`);
+  }
+  // Recent uploads submenu (last 5)
+  const recent = loadJson(HISTORY_FILE).filter(h => h.success && h.videoId).slice(0, 5);
+  const key = recent.map(h => `${h.videoId}:${h.title}`).join('|');
+  if (key !== lastRecentKey) {
+    lastRecentKey = key;
+    tray.send('recent-clear');
+    for (const h of recent) tray.send(`recent-add ${h.videoId}\t${h.title.replace(/[\r\n\t]+/g, ' ')}`);
+  }
 }
 
 function onTrayEvent(line) {
@@ -326,6 +345,7 @@ function onTrayEvent(line) {
     case 'show': showFocus(); break;
     case 'copy': if (last) { copyToClipboard(last.url); toast('Link copied', last.title); } break;
     case 'open': if (last) openInBrowser(last.url); break;
+    case 'recent': { const h = loadJson(HISTORY_FILE).find(x => x.videoId === arg); if (h) { copyToClipboard(h.url); toast('Link copied', h.title, h.url); } break; }
     case 'folder': openFolder(CFG.watchDir); break;
     case 'pause': S.paused = true; S.notice = 'Paused — new clips are ignored until you resume'; tray.send('menu-pause 1'); log('Paused watching'); if (S.view === 'idle') draw(); lastTrayState = ''; updateTray(); break;
     case 'resume': S.paused = false; S.notice = ''; tray.send('menu-pause 0'); log('Resumed watching'); startWatcher(); if (S.view === 'idle') draw(); lastTrayState = ''; updateTray(); break;
@@ -1499,7 +1519,8 @@ async function main() {
     });
     log(`Background process started (v${VERSION}) · pipe ${PIPE}`);
     runCore();
-    spawnUi();
+    // Open the UI window unless one (from before a restart) reconnects first.
+    setTimeout(() => { if (!uiAttached()) spawnUi(); }, 1500);
     return;
   }
   process.title = WIN_TITLE;
