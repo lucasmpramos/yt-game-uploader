@@ -44,6 +44,8 @@ const DEFAULT_CONFIG = {
   categoryId: '20',
   popupOnUpload: false,
   tray: true,             // tray icon; the window hides to the tray instead of minimizing
+  // Tray icon look: style arrow | triangle | upload | ring | letter | tile; colors as hex. Also in the tray menu.
+  trayIcon: { style: 'arrow', idle: '#D4537E', busy: '#40C070', error: '#E24B4A', paused: '#888780' },
   showAfterUpload: true,  // bring the window back (without stealing focus) when an upload finishes
   autoHideAfter: 120,     // seconds until an auto-shown window hides again (0 = never); any key cancels
   toast: true,
@@ -75,6 +77,7 @@ function loadConfig() {
   if (!Array.isArray(cfg.extensions) || !cfg.extensions.length) cfg.extensions = DEFAULT_CONFIG.extensions;
   cfg.extensions = cfg.extensions.map(e => (e.startsWith('.') ? e : '.' + e).toLowerCase());
   if (!cfg.games || typeof cfg.games !== 'object') cfg.games = {};
+  cfg.trayIcon = { ...DEFAULT_CONFIG.trayIcon, ...((cfg.trayIcon && typeof cfg.trayIcon === 'object') ? cfg.trayIcon : {}) };
   if (!Array.isArray(cfg.tags)) cfg.tags = DEFAULT_CONFIG.tags;
   // Write the file back when it's missing or lacks newer keys, so every option is discoverable.
   const missing = Object.keys(DEFAULT_CONFIG).some(k => !(k in fileCfg));
@@ -340,7 +343,9 @@ function onTrayEvent(line) {
   const last = S.last || lastUpload();
   if (ev !== 'ready') log(`Tray: ${line}`);
   switch (ev) {
-    case 'ready': tray.send(`menu-autostart ${autostartEnabled() ? 1 : 0}`); tray.send(`menu-pause ${S.paused ? 1 : 0}`); lastTrayState = ''; updateTray(); break;
+    case 'ready':
+      tray.send(`style ${CFG.trayIcon.style}`); tray.send(`colors ${CFG.trayIcon.idle} ${CFG.trayIcon.busy} ${CFG.trayIcon.error} ${CFG.trayIcon.paused}`);
+      tray.send(`menu-autostart ${autostartEnabled() ? 1 : 0}`); tray.send(`menu-pause ${S.paused ? 1 : 0}`); lastTrayState = ''; updateTray(); break;
     case 'click': cancelAutoHide(); if (IS_DAEMON && !uiAttached()) spawnUi(); else tray.send('toggle'); break;
     case 'show': showFocus(); break;
     case 'copy': if (last) { copyToClipboard(last.url); toast('Link copied', last.title); } break;
@@ -350,6 +355,8 @@ function onTrayEvent(line) {
     case 'pause': S.paused = true; S.notice = 'Paused — new clips are ignored until you resume'; tray.send('menu-pause 1'); log('Paused watching'); if (S.view === 'idle') draw(); lastTrayState = ''; updateTray(); break;
     case 'resume': S.paused = false; S.notice = ''; tray.send('menu-pause 0'); log('Resumed watching'); startWatcher(); if (S.view === 'idle') draw(); lastTrayState = ''; updateTray(); break;
     case 'autostart': setAutostart(arg === '1'); break;
+    case 'style': if (arg) setTrayLook({ style: arg }); break;
+    case 'color': if (arg) setTrayLook({ idle: arg }); break;
     case 'quit': shutdown('tray menu'); break;
   }
 }
@@ -1584,16 +1591,43 @@ function ensureIconAssets() {
   const exe = path.join(SCRIPT_DIR, 'tray.exe'), png = path.join(SCRIPT_DIR, 'icon.png'), ico = path.join(SCRIPT_DIR, 'icon.ico');
   try {
     if (!fs.existsSync(exe)) return;
-    if (fs.existsSync(png) && fs.statSync(png).mtimeMs >= fs.statSync(exe).mtimeMs) return;
-    execFile(exe, ['--export-icon', png, ico], { windowsHide: true, timeout: 20000 }, (e) => log(e ? `Icon export failed: ${e.message}` : 'Icon assets exported (icon.png, icon.ico)'));
+    // The build already exported the icon for the current style/color (see tray.js); just make sure it exists.
+    if (fs.existsSync(png) && fs.existsSync(ico)) return;
+    execFile(exe, ['--export-icon', png, ico, CFG.trayIcon.style, CFG.trayIcon.idle], { windowsHide: true, timeout: 20000 }, (e) => log(e ? `Icon export failed: ${e.message}` : 'Icon assets exported (icon.png, icon.ico)'));
   } catch (e) { log(`Icon export failed: ${e.message}`); }
+}
+
+// Icon style / color chosen from the tray menu: save to config.json, apply live, then rebuild the helper so the
+// app-identity icon (toast header, Start Menu shortcut, terminal window) follows.
+let trayRestartTimer = null;
+function setTrayLook(patch) {
+  Object.assign(CFG.trayIcon, patch);
+  try {
+    const file = fs.existsSync(CONFIG_FILE) ? JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')) : {};
+    file.trayIcon = { ...(file.trayIcon || {}), ...CFG.trayIcon };
+    fs.writeFileSync(CONFIG_FILE, JSON.stringify(file, null, 2));
+  } catch (e) { log(`Could not save icon settings: ${e.message}`); }
+  if (trayOn()) { tray.send(`style ${CFG.trayIcon.style}`); tray.send(`colors ${CFG.trayIcon.idle} ${CFG.trayIcon.busy} ${CFG.trayIcon.error} ${CFG.trayIcon.paused}`); }
+  log(`Tray icon: ${CFG.trayIcon.style} ${CFG.trayIcon.idle}`);
+  clearTimeout(trayRestartTimer);
+  trayRestartTimer = setTimeout(restartTray, 1500);   // let the menu close, then rebuild with the new identity icon
+}
+function restartTray() {
+  if (!CFG.tray || SIMULATE) return;
+  if (tray) { tray.stop(); tray = null; }
+  setTimeout(() => {
+    tray = startTray({ dir: SCRIPT_DIR, title: WIN_TITLE, tooltip: `${WIN_TITLE} · restarting`, onEvent: onTrayEvent, log, style: CFG.trayIcon.style, idle: CFG.trayIcon.idle });
+    lastTrayState = ''; lastRecentKey = '';
+    ensureToastIdentity();
+    if (IS_DAEMON && uiAttached()) setTimeout(() => { if (trayOn()) tray.send(`seticon ${path.join(SCRIPT_DIR, 'icon.ico')}`); }, 1500);
+  }, 900);
 }
 
 // Everything that makes the app tick (daemon and standalone modes): window helper, tray, watcher, config, clean-up.
 function runCore() {
   initWindowHelper();
   log(`Watching: ${CFG.watchDir} (v${VERSION}, ${MODE})`);
-  if (CFG.tray && !SIMULATE) tray = startTray({ dir: SCRIPT_DIR, title: WIN_TITLE, tooltip: `${WIN_TITLE} · starting`, onEvent: onTrayEvent, log });
+  if (CFG.tray && !SIMULATE) tray = startTray({ dir: SCRIPT_DIR, title: WIN_TITLE, tooltip: `${WIN_TITLE} · starting`, onEvent: onTrayEvent, log, style: CFG.trayIcon.style, idle: CFG.trayIcon.idle });
   ensureIconAssets();
   ensureToastIdentity();   // after the helper build: the shortcut takes its icon from tray.exe
   draw();

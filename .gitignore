@@ -14,3 +14,4 @@ _winctl.ps1
 tray.exe
 icon.png
 icon.ico
+tray.build.json

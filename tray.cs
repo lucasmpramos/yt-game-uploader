@@ -3,17 +3,22 @@
 //
 // Protocol (one command per line):
 //   stdin  (from Node):  tooltip <text> | status <text> | icon idle|error|paused | icon busy <pct>
+//                        style arrow|triangle|upload|ring|letter|tile | colors <idle> <busy> <error> <paused>  (hex)
 //                        menu-pause 0|1 | menu-autostart 0|1 | recent-clear | recent-add <id>\t<title>
-//                        show | shownoactivate | hide | toggle | minimize | flash | query | quit
-//   stdout (to Node):    click | show | copy | open | folder | pause | resume | autostart 0|1 | recent <id> | quit
-//                        visible 0|1 (reply to query) | ready
+//                        show | shownoactivate | hide | toggle | minimize | flash | seticon <ico> | query | quit
+//   stdout (to Node):    click | show | copy | open | folder | pause | resume | autostart 0|1 | recent <id>
+//                        style <name> | color <hex> | quit | visible 0|1 (reply to query) | ready
 // The helper exits by itself when stdin closes (Node died).
+//
+//   tray.exe --export-icon <png> <ico> [style] [idleHex]   write the identity icon (256 px PNG + multi-size ICO)
+//   tray.exe --preview <dir> [style] [idleHex]             dump every state as PNG for a visual check
 
 using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
+using System.Drawing.Text;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -40,27 +45,42 @@ class Tray : ApplicationContext
     [DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr h, uint msg, IntPtr w, IntPtr l);
     delegate bool EnumProc(IntPtr h, IntPtr lp);
     const uint WM_SETICON = 0x80;
-    readonly List<Icon> keepIcons = new List<Icon>();   // icons handed to other windows must stay alive
 
     const int SW_HIDE = 0, SW_SHOWNOACTIVATE = 4, SW_SHOW = 5, SW_MINIMIZE = 6, SW_RESTORE = 9;
     const uint SWP_NOSIZE = 1, SWP_NOMOVE = 2, SWP_NOACTIVATE = 0x10, SWP_SHOWWINDOW = 0x40;
 
-    // Palette (matches the terminal logo)
-    static readonly Color IDLE = Color.FromArgb(212, 83, 126), BUSY = Color.FromArgb(64, 192, 112),
-                          ERR = Color.FromArgb(226, 75, 74), PAUSED = Color.FromArgb(136, 135, 128),
-                          TILE_DARK = Color.FromArgb(0, 0, 0);
+    // Defaults (the app sends its config over the pipe right after "ready")
+    public static readonly string[] STYLES = { "arrow", "triangle", "upload", "ring", "letter", "tile" };
+    public static readonly string[] STYLE_LABELS = { "Arrow", "Triangle", "Triangle with base", "Ring (fills with progress)", "Letter G", "Tile" };
+    public static readonly string[][] COLORS = {
+        new[] { "Pink", "#D4537E" }, new[] { "White", "#F0F0F0" }, new[] { "Cyan", "#2D96AA" }, new[] { "Green", "#40C070" },
+        new[] { "Orange", "#EF9F27" }, new[] { "Purple", "#7F77DD" }, new[] { "Red", "#E24B4A" } };
+    static readonly Color TILE_DARK = Color.FromArgb(0, 0, 0);
+
+    string style = "arrow";
+    Color idleC = Hex("#D4537E"), busyC = Hex("#40C070"), errC = Hex("#E24B4A"), pausedC = Hex("#888780");
+    string curState = "idle"; int curPct = -1;
 
     readonly string windowTitle;
     readonly NotifyIcon icon;
     readonly ContextMenuStrip menu;
-    readonly ToolStripMenuItem statusItem, pauseItem, autostartItem, recentItem;
+    readonly ToolStripMenuItem statusItem, pauseItem, autostartItem, recentItem, styleItem, colorItem;
     readonly Dictionary<string, Icon> iconCache = new Dictionary<string, Icon>();
+    readonly List<Icon> keepIcons = new List<Icon>();
     readonly Control sync;
     readonly object writeLock = new object();
     IntPtr hwnd = IntPtr.Zero;
     // No console in a winexe: talk to Node over the raw stdin/stdout pipes, UTF-8, no BOM.
     static readonly TextReader input = new StreamReader(Console.OpenStandardInput(), new UTF8Encoding(false));
     static readonly TextWriter output = new StreamWriter(Console.OpenStandardOutput(), new UTF8Encoding(false)) { AutoFlush = true };
+
+    static Color Hex(string s)
+    {
+        try { s = s.Trim().TrimStart('#'); if (s.Length == 6) return Color.FromArgb(Convert.ToInt32(s.Substring(0, 2), 16), Convert.ToInt32(s.Substring(2, 2), 16), Convert.ToInt32(s.Substring(4, 2), 16)); }
+        catch { }
+        return Color.Magenta;
+    }
+    static string ToHex(Color c) { return "#" + c.R.ToString("X2") + c.G.ToString("X2") + c.B.ToString("X2"); }
 
     Tray(string title, string tooltip)
     {
@@ -80,8 +100,7 @@ class Tray : ApplicationContext
         menu.Items.Add(new ToolStripMenuItem("Copy last link", null, (s, e) => Send("copy")));
         menu.Items.Add(new ToolStripMenuItem("Open last clip", null, (s, e) => Send("open")));
         recentItem = new ToolStripMenuItem("Recent uploads");
-        recentItem.DropDown.Renderer = menu.Renderer;
-        recentItem.DropDown.Font = menu.Font;
+        Sub(recentItem);
         menu.Items.Add(recentItem);
         menu.Items.Add(new ToolStripMenuItem("Open watch folder", null, (s, e) => Send("folder")));
         menu.Items.Add(new ToolStripSeparator());
@@ -90,16 +109,35 @@ class Tray : ApplicationContext
         autostartItem = new ToolStripMenuItem("Start with Windows", null, (s, e) => Send("autostart " + (autostartItem.Checked ? "0" : "1")));
         menu.Items.Add(autostartItem);
         menu.Items.Add(new ToolStripSeparator());
+        styleItem = new ToolStripMenuItem("Icon");
+        Sub(styleItem);
+        for (int i = 0; i < STYLES.Length; i++) { var st = STYLES[i]; styleItem.DropDownItems.Add(new ToolStripMenuItem(STYLE_LABELS[i], null, (s, e) => Send("style " + st)) { Tag = st }); }
+        menu.Items.Add(styleItem);
+        colorItem = new ToolStripMenuItem("Color");
+        Sub(colorItem);
+        foreach (var c in COLORS) { var hex = c[1]; colorItem.DropDownItems.Add(new ToolStripMenuItem(c[0], null, (s, e) => Send("color " + hex)) { Tag = hex.ToUpperInvariant() }); }
+        menu.Items.Add(colorItem);
+        menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(new ToolStripMenuItem("Quit", null, (s, e) => Send("quit")));
         SetRecent(new List<KeyValuePair<string, string>>());
+        SyncChecks();
 
-        icon = new NotifyIcon { Icon = GetIcon(IDLE, -1), Text = Clip(tooltip), ContextMenuStrip = menu, Visible = true };
+        icon = new NotifyIcon { Icon = CurrentIcon(), Text = Clip(tooltip), ContextMenuStrip = menu, Visible = true };
         icon.MouseClick += (s, e) => { if (e.Button == MouseButtons.Left) Send("click"); };
         icon.DoubleClick += (s, e) => Send("show");
 
         var reader = new Thread(ReadLoop) { IsBackground = true };
         reader.Start();
         Send("ready");
+    }
+
+    void Sub(ToolStripMenuItem item) { item.DropDown.Renderer = menu.Renderer; item.DropDown.Font = menu.Font; ((ToolStripDropDownMenu)item.DropDown).ShowImageMargin = false; ((ToolStripDropDownMenu)item.DropDown).ShowCheckMargin = true; }
+
+    void SyncChecks()
+    {
+        foreach (ToolStripMenuItem mi in styleItem.DropDownItems) mi.Checked = (string)mi.Tag == style;
+        var cur = ToHex(idleC).ToUpperInvariant();
+        foreach (ToolStripMenuItem mi in colorItem.DropDownItems) mi.Checked = (string)mi.Tag == cur;
     }
 
     static bool IsDarkTheme()
@@ -115,24 +153,25 @@ class Tray : ApplicationContext
         catch { return true; }
     }
 
-    // ---- icon: colored rounded tile with a white pixel "▲"; busy tiles fill bottom-up with the upload progress ----
-    Icon GetIcon(Color c, int pct)
+    // ---- icons ----
+    Icon CurrentIcon()
     {
-        int bucket = pct < 0 ? -1 : (pct / 10) * 10;   // one icon per 10% step
-        string key = c.ToArgb() + ":" + bucket;
+        Color c = curState == "busy" ? busyC : curState == "error" ? errC : curState == "paused" ? pausedC : idleC;
+        int pct = curState == "busy" ? Math.Max(0, curPct) : -1;
+        int bucket = pct < 0 ? -1 : (pct / 10) * 10;
+        string key = style + ":" + c.ToArgb() + ":" + bucket;
         Icon ic;
         if (iconCache.TryGetValue(key, out ic)) return ic;
-        ic = BuildIcon(c, bucket);
+        ic = BuildIcon(style, c, bucket, null);
         iconCache[key] = ic;
         return ic;
     }
 
-    static Icon BuildIcon(Color c, int pct, int[] sizes = null)
+    static Icon BuildIcon(string style, Color c, int pct, int[] sizes)
     {
         if (sizes == null) sizes = new[] { 16, 20, 24, 32 };
         var pngs = new List<byte[]>();
-        foreach (var s in sizes) pngs.Add(RenderPng(s, c, pct));
-        // Assemble a .ico (PNG entries) so Windows picks the right size for the current DPI.
+        foreach (var s in sizes) pngs.Add(RenderPng(s, style, c, pct));
         using (var ms = new MemoryStream())
         using (var w = new BinaryWriter(ms))
         {
@@ -140,7 +179,7 @@ class Tray : ApplicationContext
             int offset = 6 + 16 * sizes.Length;
             for (int i = 0; i < sizes.Length; i++)
             {
-                w.Write((byte)(sizes[i] == 256 ? 0 : sizes[i])); w.Write((byte)(sizes[i] == 256 ? 0 : sizes[i]));
+                w.Write((byte)(sizes[i] >= 256 ? 0 : sizes[i])); w.Write((byte)(sizes[i] >= 256 ? 0 : sizes[i]));
                 w.Write((byte)0); w.Write((byte)0); w.Write((short)1); w.Write((short)32);
                 w.Write(pngs[i].Length); w.Write(offset);
                 offset += pngs[i].Length;
@@ -151,7 +190,9 @@ class Tray : ApplicationContext
         }
     }
 
-    static byte[] RenderPng(int size, Color c, int pct)
+    // One state of one style at one size. pct >= 0 = uploading: flat glyphs fill bottom-up with the color
+    // (dim silhouette behind), the ring draws an arc, the tile fills.
+    static byte[] RenderPng(int size, string style, Color c, int pct)
     {
         using (var bmp = new Bitmap(size, size, PixelFormat.Format32bppArgb))
         {
@@ -159,41 +200,87 @@ class Tray : ApplicationContext
             {
                 g.Clear(Color.Transparent);
                 g.SmoothingMode = SmoothingMode.AntiAlias;
-                float r = size * 0.22f;
-                var tile = RoundedRect(new RectangleF(0.5f, 0.5f, size - 1, size - 1), r);
-                if (pct < 0)
+                g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                float s = size;
+                if (style == "tile")
                 {
-                    using (var b = new SolidBrush(c)) g.FillPath(b, tile);
+                    var tile = RoundedRect(new RectangleF(0.5f, 0.5f, s - 1, s - 1), s * 0.22f);
+                    if (pct < 0) { using (var b = new SolidBrush(c)) g.FillPath(b, tile); }
+                    else
+                    {
+                        using (var b = new SolidBrush(TILE_DARK)) g.FillPath(b, tile);
+                        float h = (s - 1) * Math.Max(0.08f, pct / 100f);
+                        g.SetClip(tile);
+                        using (var b = new SolidBrush(c)) g.FillRectangle(b, 0, s - h, s, h);
+                        g.ResetClip();
+                    }
+                    using (var wb = new SolidBrush(Color.White))
+                        g.FillPolygon(wb, new[] { new PointF(s * 0.5f, s * 0.22f), new PointF(s * 0.8f, s * 0.74f), new PointF(s * 0.2f, s * 0.74f) });
+                }
+                else if (style == "ring")
+                {
+                    float w = Math.Max(1.5f, s / 7f);
+                    var rect = new RectangleF(w / 2 + 0.5f, w / 2 + 0.5f, s - w - 1, s - w - 1);
+                    using (var rp = new Pen(c, w))
+                    {
+                        if (pct < 0) g.DrawEllipse(rp, rect);
+                        else { using (var dim = new Pen(Color.FromArgb(70, c), w)) g.DrawEllipse(dim, rect); if (pct > 0) g.DrawArc(rp, rect, -90, 360f * pct / 100f); }
+                    }
+                    DrawArrow(g, s, c, 0.34f, 0.5f, 0.32f, 0.70f, Math.Max(1.5f, s / 9f), false);
                 }
                 else
                 {
-                    // dark tile, colored fill rising with progress
-                    using (var b = new SolidBrush(TILE_DARK)) g.FillPath(b, tile);
-                    float h = (size - 1) * Math.Max(0.08f, pct / 100f);
-                    var old = g.Clip;
-                    g.SetClip(tile);
-                    using (var b = new SolidBrush(c)) g.FillRectangle(b, 0, size - h, size, h);
-                    g.Clip = old;
-                }
-                // Pixel-art "upload" glyph (arrow over a base line) on a 6x7 grid, scaled by whole pixels so it
-                // stays crisp at every size: 2 px cells at 16, 4 px at 32, 32 px at 256.
-                g.SmoothingMode = SmoothingMode.None;
-                string[] grid = { "..##..", ".####.", "######", "..##..", "..##..", "......", "######" };
-                int cell = Math.Max(1, size / 8);
-                int ox = (size - 6 * cell) / 2, oy = (size - 7 * cell) / 2;
-                using (var sh = new SolidBrush(Color.FromArgb(80, 0, 0, 0)))
-                using (var wb = new SolidBrush(Color.White))
-                {
-                    for (int pass = 0; pass < 2; pass++)
-                        for (int y = 0; y < 7; y++) for (int x = 0; x < 6; x++)
-                            if (grid[y][x] == '#')
-                            {
-                                if (pass == 0 && size >= 24) g.FillRectangle(sh, ox + x * cell + cell / 2, oy + y * cell + cell / 2, cell, cell);   // soft drop shadow (bigger sizes only)
-                                if (pass == 1) g.FillRectangle(wb, ox + x * cell, oy + y * cell, cell, cell);
-                            }
+                    // flat silhouettes: draw dim + clipped full-color for progress, or just full color
+                    if (pct < 0) DrawFlat(g, s, style, c);
+                    else
+                    {
+                        DrawFlat(g, s, style, Color.FromArgb(75, c));
+                        float h = s * Math.Max(0.06f, pct / 100f);
+                        g.SetClip(new RectangleF(0, s - h, s, h));
+                        DrawFlat(g, s, style, c);
+                        g.ResetClip();
+                    }
                 }
             }
             using (var ms = new MemoryStream()) { bmp.Save(ms, ImageFormat.Png); return ms.ToArray(); }
+        }
+    }
+
+    static void DrawFlat(Graphics g, float s, string style, Color c)
+    {
+        using (var b = new SolidBrush(c))
+        {
+            if (style == "arrow")
+            {
+                DrawArrow(g, s, c, 0.22f, 0.78f, 0.15f, 0.66f, Math.Max(1.5f, s / 8f), true);
+                using (var p = new Pen(c, Math.Max(1.5f, s / 8f)) { StartCap = LineCap.Round, EndCap = LineCap.Round }) g.DrawLine(p, s * 0.18f, s * 0.88f, s * 0.82f, s * 0.88f);
+            }
+            else if (style == "triangle")
+                g.FillPolygon(b, new[] { new PointF(s * 0.5f, s * 0.1f), new PointF(s * 0.92f, s * 0.86f), new PointF(s * 0.08f, s * 0.86f) });
+            else if (style == "upload")
+            {
+                g.FillPolygon(b, new[] { new PointF(s * 0.5f, s * 0.08f), new PointF(s * 0.9f, s * 0.66f), new PointF(s * 0.1f, s * 0.66f) });
+                g.FillRectangle(b, s * 0.1f, s * 0.78f, s * 0.8f, Math.Max(1.5f, s * 0.13f));
+            }
+            else if (style == "letter")
+            {
+                g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
+                using (var f = new Font("Segoe UI", s * 0.62f, FontStyle.Bold, GraphicsUnit.Pixel))
+                using (var sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
+                    g.DrawString("G", f, b, new RectangleF(0, 0, s, s * 1.02f), sf);
+            }
+            else DrawFlat(g, s, "arrow", c);
+        }
+    }
+
+    // chevron + stem: xl/xr = chevron ends, yt = tip, yb = stem bottom (all fractions of size)
+    static void DrawArrow(Graphics g, float s, Color c, float xl, float xr, float yt, float yb, float width, bool bigStem)
+    {
+        using (var p = new Pen(c, width) { StartCap = LineCap.Round, EndCap = LineCap.Round, LineJoin = LineJoin.Round })
+        {
+            float ych = yt + (xr - xl) * 0.55f;
+            g.DrawLines(p, new[] { new PointF(s * xl, s * ych), new PointF(s * 0.5f, s * yt), new PointF(s * xr, s * ych) });
+            g.DrawLine(p, s * 0.5f, s * (yt + 0.02f), s * 0.5f, s * yb);
         }
     }
 
@@ -212,11 +299,9 @@ class Tray : ApplicationContext
     // ---- menu rendering: hover highlight + light/dark theme ----
     class MenuRenderer : ToolStripProfessionalRenderer
     {
-        readonly bool dark;
         readonly Color bg, fg, dim, hover, sep;
         public MenuRenderer(bool dark) : base(new ProfessionalColorTable { UseSystemColors = false })
         {
-            this.dark = dark;
             bg = dark ? Color.FromArgb(32, 32, 34) : Color.FromArgb(249, 249, 249);
             fg = dark ? Color.FromArgb(240, 240, 240) : Color.FromArgb(28, 28, 28);
             dim = dark ? Color.FromArgb(150, 150, 150) : Color.FromArgb(110, 110, 110);
@@ -232,11 +317,7 @@ class Tray : ApplicationContext
             var rc = new Rectangle(2, 0, e.Item.Width - 4, e.Item.Height);
             if (e.Item.Selected && e.Item.Enabled) { using (var b = new SolidBrush(hover)) e.Graphics.FillRectangle(b, rc); }
         }
-        protected override void OnRenderItemText(ToolStripItemTextRenderEventArgs e)
-        {
-            e.TextColor = e.Item.Enabled ? fg : dim;
-            base.OnRenderItemText(e);
-        }
+        protected override void OnRenderItemText(ToolStripItemTextRenderEventArgs e) { e.TextColor = e.Item.Enabled ? fg : dim; base.OnRenderItemText(e); }
         protected override void OnRenderSeparator(ToolStripSeparatorRenderEventArgs e)
         {
             int y = e.Item.Height / 2;
@@ -253,6 +334,7 @@ class Tray : ApplicationContext
         }
         protected override void OnRenderArrow(ToolStripArrowRenderEventArgs e) { e.ArrowColor = fg; base.OnRenderArrow(e); }
     }
+
     // ---- recent uploads submenu ----
     readonly List<KeyValuePair<string, string>> recent = new List<KeyValuePair<string, string>>();
     void SetRecent(List<KeyValuePair<string, string>> items)
@@ -325,10 +407,23 @@ class Tray : ApplicationContext
             case "icon":
             {
                 var parts = arg.Split(' ');
-                var state = parts[0];
-                int pct = -1;
-                if (state == "busy" && parts.Length > 1) int.TryParse(parts[1], out pct);
-                icon.Icon = state == "busy" ? GetIcon(BUSY, pct < 0 ? 0 : pct) : state == "error" ? GetIcon(ERR, -1) : state == "paused" ? GetIcon(PAUSED, -1) : GetIcon(IDLE, -1);
+                curState = parts[0];
+                curPct = -1;
+                if (curState == "busy" && parts.Length > 1) int.TryParse(parts[1], out curPct);
+                icon.Icon = CurrentIcon();
+                break;
+            }
+            case "style":
+                if (Array.IndexOf(STYLES, arg) >= 0) { style = arg; iconCache.Clear(); icon.Icon = CurrentIcon(); SyncChecks(); }
+                break;
+            case "colors":
+            {
+                var p = arg.Split(' ');
+                if (p.Length >= 1) idleC = Hex(p[0]);
+                if (p.Length >= 2) busyC = Hex(p[1]);
+                if (p.Length >= 3) errC = Hex(p[2]);
+                if (p.Length >= 4) pausedC = Hex(p[3]);
+                iconCache.Clear(); icon.Icon = CurrentIcon(); SyncChecks();
                 break;
             }
             case "menu-pause": pauseItem.Checked = arg == "1"; pauseItem.Text = arg == "1" ? "Resume watching" : "Pause watching"; break;
@@ -394,18 +489,20 @@ class Tray : ApplicationContext
     static void Main(string[] args)
     {
         if (args.Length > 2 && args[0] == "--export-icon")
-        {   // tray.exe --export-icon <png> <ico>: a 256 px PNG (used in toasts) and a multi-size .ico of the idle icon
-            File.WriteAllBytes(args[1], RenderPng(256, IDLE, -1));
-            using (var ic = BuildIcon(IDLE, -1, new[] { 16, 24, 32, 48, 64, 128, 256 }))
+        {   // tray.exe --export-icon <png> <ico> [style] [idleHex]
+            var st = args.Length > 3 ? args[3] : "arrow"; var col = Hex(args.Length > 4 ? args[4] : "#D4537E");
+            File.WriteAllBytes(args[1], RenderPng(256, st, col, -1));
+            using (var ic = BuildIcon(st, col, -1, new[] { 16, 24, 32, 48, 64, 128, 256 }))
             using (var fs = File.Create(args[2])) ic.Save(fs);
             return;
         }
         if (args.Length > 1 && args[0] == "--preview")
-        {   // tray.exe --preview <dir>: write the icon variants as PNGs (for checking the artwork)
+        {   // tray.exe --preview <dir> [style] [idleHex]: every state as PNG
+            var st = args.Length > 2 ? args[2] : "arrow"; var col = Hex(args.Length > 3 ? args[3] : "#D4537E");
             Directory.CreateDirectory(args[1]);
-            var variants = new[] { new { n = "idle", c = IDLE, p = -1 }, new { n = "busy-30", c = BUSY, p = 30 }, new { n = "busy-70", c = BUSY, p = 70 }, new { n = "error", c = ERR, p = -1 }, new { n = "paused", c = PAUSED, p = -1 } };
+            var variants = new[] { new { n = "idle", c = col, p = -1 }, new { n = "busy-30", c = Hex("#40C070"), p = 30 }, new { n = "busy-70", c = Hex("#40C070"), p = 70 }, new { n = "error", c = Hex("#E24B4A"), p = -1 }, new { n = "paused", c = Hex("#888780"), p = -1 } };
             foreach (var v in variants) foreach (var s in new[] { 16, 32, 64 })
-                File.WriteAllBytes(Path.Combine(args[1], v.n + "-" + s + ".png"), RenderPng(s, v.c, v.p));
+                File.WriteAllBytes(Path.Combine(args[1], v.n + "-" + s + ".png"), RenderPng(s, st, v.c, v.p));
             return;
         }
         var title = args.Length > 0 ? args[0] : "GameUploader";
