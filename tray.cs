@@ -103,6 +103,7 @@ class Tray : ApplicationContext
         Sub(recentItem);
         menu.Items.Add(recentItem);
         menu.Items.Add(new ToolStripMenuItem("Open watch folder", null, (s, e) => Send("folder")));
+        menu.Items.Add(new ToolStripMenuItem("Upload a file…", null, (s, e) => PickFile()));
         menu.Items.Add(new ToolStripSeparator());
         pauseItem = new ToolStripMenuItem("Pause watching", null, (s, e) => Send(pauseItem.Checked ? "resume" : "pause"));
         menu.Items.Add(pauseItem);
@@ -350,6 +351,17 @@ class Tray : ApplicationContext
         }
     }
 
+    // "Upload a file…": a standard file dialog (topmost, so it doesn't hide behind the game); each pick is sent as "file <path>".
+    void PickFile()
+    {
+        using (var owner = new Form { TopMost = true, ShowInTaskbar = false, Opacity = 0, Size = new Size(1, 1), StartPosition = FormStartPosition.CenterScreen })
+        using (var dlg = new OpenFileDialog { Title = "Upload a clip to YouTube", Filter = "Videos|*.mp4;*.mkv;*.mov;*.webm;*.avi|All files|*.*", Multiselect = true })
+        {
+            owner.Show();
+            if (dlg.ShowDialog(owner) == DialogResult.OK) foreach (var f in dlg.FileNames) Send("file " + f);
+        }
+    }
+
     static string Clip(string s, int max = 63) { return s.Length > max ? s.Substring(0, max - 1) + "…" : s; }
 
     void Send(string line) { lock (writeLock) { try { output.WriteLine(line); } catch { } } }
@@ -457,6 +469,7 @@ class Tray : ApplicationContext
                 }
                 break;
             }
+            case "pickfile": PickFile(); break;
             case "query": { var h = FindWindow(); Send("visible " + (h != IntPtr.Zero && IsWindowVisible(h) && !IsIconic(h) ? "1" : "0")); break; }
             case "quit": Exit(); break;
         }

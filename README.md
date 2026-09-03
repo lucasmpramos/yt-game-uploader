@@ -47,13 +47,21 @@ Closing the terminal window with ✕ only closes the window — the background p
 
 **Error** — plain-English messages instead of raw API errors: daily limit reached (with the reset time), Google sign-in expired (`A` to sign in again), no internet (auto-retries with a visible countdown).
 
-**History** — browse past uploads with the arrow keys, `Enter` opens one, `C` copies its link.
+**History** — browse past uploads with the arrow keys, `Enter` opens one, `C` copies its link, `X` deletes that file from disk.
+
+**Settings** (`S`) — every option that matters, edited with the keyboard: privacy, tags, title/description templates, playlists, alerts, auto-delete, daily limit, low-disk warning, window behavior, tray icon and color, file types, watch folder. Saved to `config.json` as you go.
+
+**Stats** (`I`) — uploads this week/month, total size, average speed, biggest clip, and a per-game breakdown. `E` exports `history.csv`.
+
+**Upload a file** (`U`, or the tray menu) — pick any video from anywhere; it's uploaded in place and never auto-deleted.
 
 ## Keyboard
 
 ```
 Dashboard   C copy last link · O open · L open in YouTube Studio · T edit title · P privacy
-            H history · F open folder · D clean up · R restart · Q minimize
+            H history · I stats · S settings · U upload any file · F open folder · D clean up · R restart · Q hide
+Settings    ↑↓ select · ←→ change · Enter edit/toggle · Esc back
+Stats       E export history.csv · Esc back
 Uploading   T edit title · P privacy (applied when the upload finishes) · X cancel · S skip next · Q minimize
 Done        T edit title · P privacy · C copy · O open · L studio · Q minimize
 Error       Enter retry · A sign in again · Esc give up · Q minimize
@@ -67,7 +75,9 @@ Anywhere    ? help · Esc back · Ctrl+C quit
 - **Never interrupts the game** — stays minimized, signals with a toast and taskbar flash (`popupOnUpload` in config if you prefer the old behavior)
 - **Windows toast** on completion; clicking it opens the video
 - **Nice titles** — `ARC Raiders - 2026-08-27 12-57-02 AM.mp4` becomes `ARC Raiders — Aug 27, 2026 00:57`, and the game name is added as a tag
-- **Daily limit awareness** — YouTube's API allows roughly 6 uploads per day on the default quota; the app shows your count, and if you hit the limit it queues the clip and resumes automatically after the reset
+- **Daily limit awareness** — YouTube's API allows roughly 6 uploads per day on the default quota; the app shows your count, warns you at the last slot, and if you hit the limit it queues the clip and resumes automatically after the reset
+- **Low disk warning** — a toast and a dashboard line when the recording drive drops below `lowDiskGB`, with how much `D` would free
+- **Sleep-proof** — after the PC wakes, the folder is rescanned so a clip recorded right before sleep isn't missed
 - **Auto clean-up** — clips are deleted from disk 7 days after a confirmed upload (`deleteAfterDays`, 0 to disable); `D` cleans up immediately, or `X` on a single entry in History
 - **Resumable uploads** — a dropped connection continues from the last confirmed byte instead of restarting a multi-GB clip; an upload session even survives an app restart
 - **Waits for the recorder** — uploads start only when the file has stopped growing *and* no other program still has it open for writing
@@ -131,6 +141,8 @@ On first run a `config.json` is created with defaults you can edit:
 | `deleteAfterDays` | `7` | Auto-delete uploaded clips from disk after N days (0 = never) |
 | `dailyUploadLimit` | `6` | Your YouTube API daily upload allowance |
 | `minSizeMB` | `1` | Ignore files smaller than this |
+| `lowDiskGB` | `10` | Warn when the recording drive has less free space than this (0 = off) |
+| `trayIcon` | `{ style: "arrow", idle: "#D4537E", … }` | Tray icon style and colors (also in the tray menu and Settings) |
 | `titleTemplate` | `{game} — {date} {time}` | YouTube title (only used when a game name is found in the filename) |
 | `descriptionTemplate` | `{game} gameplay · {date}\nUploaded automatically by GameUploader` | YouTube description |
 | `playlists` | `true` | Add each clip to a playlist named after the game |

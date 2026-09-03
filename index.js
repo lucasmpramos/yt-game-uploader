@@ -55,6 +55,7 @@ const DEFAULT_CONFIG = {
   deleteAfterDays: 7,
   dailyUploadLimit: 6,
   minSizeMB: 1,
+  lowDiskGB: 10,          // toast + dashboard warning when the recording drive has less free space than this (0 = off)
   // Placeholders: {game} {date} {time} {file} {size}
   titleTemplate: '{game} — {date} {time}',
   descriptionTemplate: '{game} gameplay · {date}\nUploaded automatically by GameUploader',
@@ -200,14 +201,15 @@ function loadUploaded() {
   return raw.map(e => (typeof e === 'string' ? { path: e, status: 'uploaded', ts: null } : e));
 }
 function saveUploaded(list) { saveJson(UPLOADED_FILE, list); }
+const isInWatchDir = p => path.resolve(p).toLowerCase().startsWith(path.resolve(CFG.watchDir).toLowerCase() + path.sep);
 function markFile(filepath, status, extra = {}) {
   const list = loadUploaded().filter(e => e.path !== filepath);
-  list.push({ path: filepath, status, ts: Date.now(), ...extra });
+  list.push({ path: filepath, status, ts: Date.now(), external: !isInWatchDir(filepath), ...extra });
   saveUploaded(list);
 }
 function isKnownFile(filepath) { return loadUploaded().some(e => e.path === filepath); }
 function uploadedOnDisk() {
-  return loadUploaded().filter(e => e.status === 'uploaded' && fs.existsSync(e.path));
+  return loadUploaded().filter(e => e.status === 'uploaded' && !e.external && fs.existsSync(e.path));
 }
 
 function addHistory(entry) {
@@ -228,7 +230,7 @@ function autoClean() {
   const cutoff = Date.now() - CFG.deleteAfterDays * 86400 * 1000;
   let n = 0, freed = 0;
   for (const e of loadUploaded()) {
-    if (e.status !== 'uploaded' || !e.ts || e.ts > cutoff || !fs.existsSync(e.path)) continue;
+    if (e.status !== 'uploaded' || e.external || !e.ts || e.ts > cutoff || !fs.existsSync(e.path)) continue;
     try { const s = fs.statSync(e.path).size; fs.unlinkSync(e.path); n++; freed += s; log(`Auto-deleted: ${path.basename(e.path)}`); } catch (err) { log(`Auto-delete failed: ${err.message}`); }
   }
   if (n) { log(`Auto-clean: ${n} files, ${fmtBytes(freed)} freed`); S.notice = `Auto-cleaned ${n} old clip(s), ${fmtBytes(freed)} freed`; }
@@ -339,7 +341,8 @@ function updateTray() {
 }
 
 function onTrayEvent(line) {
-  const [ev, arg] = line.split(' ');
+  const sp = line.indexOf(' ');
+  const ev = sp < 0 ? line : line.slice(0, sp), arg = sp < 0 ? '' : line.slice(sp + 1).trim();
   const last = S.last || lastUpload();
   if (ev !== 'ready') log(`Tray: ${line}`);
   switch (ev) {
@@ -352,6 +355,13 @@ function onTrayEvent(line) {
     case 'open': if (last) openInBrowser(last.url); break;
     case 'recent': { const h = loadJson(HISTORY_FILE).find(x => x.videoId === arg); if (h) { copyToClipboard(h.url); toast('Link copied', h.title, h.url); } break; }
     case 'folder': openFolder(CFG.watchDir); break;
+    case 'file': {   // picked with "Upload a file…": uploaded in place, never auto-deleted
+      if (!arg || !fs.existsSync(arg)) break;
+      if (isKnownFile(arg)) { S.notice = `Already handled: ${path.basename(arg)}`; }
+      else { enqueueFile(arg); S.notice = `Queued ${path.basename(arg)}`; }
+      if (S.view === 'idle' || S.view === 'done') draw();
+      break;
+    }
     case 'pause': S.paused = true; S.notice = 'Paused — new clips are ignored until you resume'; tray.send('menu-pause 1'); log('Paused watching'); if (S.view === 'idle') draw(); lastTrayState = ''; updateTray(); break;
     case 'resume': S.paused = false; S.notice = ''; tray.send('menu-pause 0'); log('Resumed watching'); startWatcher(); if (S.view === 'idle') draw(); lastTrayState = ''; updateTray(); break;
     case 'autostart': setAutostart(arg === '1'); break;
@@ -547,7 +557,7 @@ const S = {
 // Daemon ⇄ UI pipe: the daemon publishes state on every draw(), the UI renders it and sends keys back
 // ---------------------------------------------------------------------------
 const STATE_FIELDS = ['view', 'queue', 'current', 'last', 'error', 'waitUntil', 'waitReason', 'waitFile', 'histCursor', 'histConfirm',
-  'editBuf', 'editFresh', 'editTarget', 'editReturn', 'notice', 'paused', 'busy', 'helpReturn'];
+  'editBuf', 'editFresh', 'editTarget', 'editReturn', 'notice', 'paused', 'busy', 'helpReturn', 'setCursor', 'lowDisk'];
 const uiClients = new Set();
 let uiEverAttached = false;
 
@@ -686,6 +696,8 @@ function draw() {
   if (IS_UI && !S.connected) { drawDisconnected(); return; }
   switch (S.view) {
     case 'help': drawHelp(); break;
+    case 'settings': drawSettings(); break;
+    case 'stats': drawStats(); break;
     case 'idle': drawIdle(); break;
     case 'uploading': drawUploading(); break;
     case 'done': drawDone(); break;
@@ -761,16 +773,158 @@ function drawIdle() {
     const size = onDisk.reduce((a, e) => { try { return a + fs.statSync(e.path).size; } catch { return a; } }, 0);
     L.push(lr(`  ${C.yellow}${fmtBytes(size)}${C.reset} in ${plural(onDisk.length, 'uploaded clip')} waiting for clean-up`, `${C.dim}press${C.reset} ${cap('D')}`));
   }
+  if (S.lowDisk) L.push(lr(`  ${C.red}⚠ ${S.lowDisk.freeGB.toFixed(1)} GB free${C.reset} on the recording drive`, onDisk.length ? `${C.dim}press${C.reset} ${cap('D')}` : ''));
   L.push(...queueLines());
   if (needsFullScope()) { L.push(''); L.push(lr(`  ${C.yellow}Playlists and HD-ready alerts need a one-time re-sign-in${C.reset}`, `${C.dim}press${C.reset} ${cap('A')}`)); }
   if (S.notice) { L.push(''); L.push(`  ${C.green}${S.notice}${C.reset}`); }
   L.push('');
   if (last) L.push(keys(['C', 'copy link'], ['O', 'open'], ['L', 'studio'], ['T', 'edit title'], ['P', `privacy: ${last.privacy || CFG.privacy}`]));
-  const k = [['H', 'history'], ['F', 'folder']];
+  const k = [['H', 'history'], ['I', 'stats'], ['S', 'settings'], ['U', 'upload a file'], ['F', 'folder']];
   if (onDisk.length) k.push(['D', 'clean up']);
-  k.push(['?', 'help'], ['R', 'restart'], ['Q', hideLabel()]);
+  k.push(['?', 'help'], ['Q', hideLabel()]);
   L.push(keys(...k));
   render(L);
+}
+
+// ---------------------------------------------------------------------------
+// Settings screen: every config key that matters, editable with the keyboard, saved to config.json
+// ---------------------------------------------------------------------------
+const PRIVACY = ['unlisted', 'public', 'private'];
+const TRAY_COLORS = { '#D4537E': 'pink', '#F0F0F0': 'white', '#2D96AA': 'cyan', '#40C070': 'green', '#EF9F27': 'orange', '#7F77DD': 'purple', '#E24B4A': 'red' };
+const SETTINGS = [
+  { key: 'privacy', label: 'Privacy', type: 'cycle', options: PRIVACY },
+  { key: 'tags', label: 'Tags', type: 'text', get: () => CFG.tags.join(', '), parse: v => v.split(',').map(x => x.trim()).filter(Boolean) },
+  { key: 'titleTemplate', label: 'Title template', type: 'text', hint: '{game} {date} {time} {file} {size}' },
+  { key: 'descriptionTemplate', label: 'Description template', type: 'text', get: () => CFG.descriptionTemplate.replace(/\n/g, ' ⏎ '), parse: v => v.replace(/ ?⏎ ?/g, '\n'), hint: '⏎ = new line' },
+  { key: 'playlists', label: 'Playlist per game', type: 'toggle' },
+  { key: 'hdReadyToast', label: 'Ready-in-full-quality alert', type: 'toggle' },
+  { key: 'deleteAfterDays', label: 'Auto-delete uploaded clips after', type: 'number', min: 0, max: 365, step: 1, unit: 'days', zero: 'never' },
+  { key: 'dailyUploadLimit', label: 'Daily upload limit', type: 'number', min: 1, max: 50, step: 1 },
+  { key: 'lowDiskGB', label: 'Low disk warning below', type: 'number', min: 0, max: 500, step: 5, unit: 'GB', zero: 'off' },
+  { key: 'showAfterUpload', label: 'Show window after an upload', type: 'toggle' },
+  { key: 'autoHideAfter', label: 'Auto-hide the window after', type: 'number', min: 0, max: 3600, step: 30, unit: 's', zero: 'never' },
+  { key: 'popupOnUpload', label: 'Show window when a clip is detected', type: 'toggle' },
+  { key: 'toast', label: 'Notifications', type: 'toggle' },
+  { key: 'sounds', label: 'Sounds', type: 'toggle' },
+  { key: 'clipboard', label: 'Copy link to clipboard', type: 'toggle' },
+  { key: 'trayIcon.style', label: 'Tray icon', type: 'cycle', options: ['arrow', 'triangle', 'upload', 'ring', 'letter', 'tile'] },
+  { key: 'trayIcon.idle', label: 'Tray color', type: 'cycle', options: Object.keys(TRAY_COLORS), names: TRAY_COLORS },
+  { key: 'extensions', label: 'File types', type: 'text', get: () => CFG.extensions.map(e => e.slice(1)).join(', '), parse: v => v.split(',').map(x => x.trim().replace(/^\./, '')).filter(Boolean).map(x => '.' + x.toLowerCase()) },
+  { key: 'watchDir', label: 'Watch folder', type: 'text', get: () => CFG.watchDir },
+  { key: 'games', label: 'Per-game rules', type: 'info', get: () => `${plural(Object.keys(CFG.games).length, 'game')} · edit in config.json` },
+];
+const getCfg = key => key.split('.').reduce((o, k) => (o == null ? undefined : o[k]), CFG);
+function settingValue(item) {
+  if (item.get) return item.get();
+  const v = getCfg(item.key);
+  if (item.type === 'toggle') return v ? 'on' : 'off';
+  if (item.type === 'number') return v === 0 && item.zero ? item.zero : `${v}${item.unit ? ' ' + item.unit : ''}`;
+  if (item.names) return item.names[v] || v;
+  return String(v);
+}
+// Writes one key into config.json (nested keys ok); the config watcher picks it up, and we apply it right away too.
+function applySetting(key, raw) {
+  const item = SETTINGS.find(i => i.key === key);
+  if (!item) return;
+  let value = raw;
+  if (item.parse) value = item.parse(raw);
+  if (key === 'trayIcon.style') { setTrayLook({ style: value }); return; }
+  if (key === 'trayIcon.idle') { setTrayLook({ idle: value }); return; }
+  if (key === 'watchDir') { value = String(value).trim().replace(/^~(?=[\\/])/, os.homedir()); if (!value) return; }
+  const parts = key.split('.'); let o = CFG; for (const p of parts.slice(0, -1)) o = o[p] = o[p] || {}; o[parts[parts.length - 1]] = value;
+  try {
+    const file = fs.existsSync(CONFIG_FILE) ? JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')) : {};
+    let f = file; for (const p of parts.slice(0, -1)) f = f[p] = f[p] || {}; f[parts[parts.length - 1]] = value;
+    fs.writeFileSync(CONFIG_FILE, JSON.stringify(file, null, 2));
+  } catch (e) { S.notice = `${C.red}Could not save: ${e.message}${C.reset}`; return; }
+  if (key === 'watchDir') startWatcher();
+  if (key === 'lowDiskGB') checkDisk();
+  S.notice = `Saved: ${item.label}`;
+  log(`Setting ${key} = ${JSON.stringify(value)}`);
+}
+function stepSetting(item, dir, enter) {
+  if (item.type === 'info') return;
+  if (item.type === 'text') { if (enter || dir) startEdit('setting:' + item.key, 'settings', settingValue(item)); return; }
+  if (item.type === 'toggle') { applySetting(item.key, !getCfg(item.key)); draw(); return; }
+  if (item.type === 'cycle') { const i = item.options.indexOf(getCfg(item.key)); applySetting(item.key, item.options[(i + dir + item.options.length) % item.options.length]); draw(); return; }
+  if (item.type === 'number') { const v = Math.min(item.max, Math.max(item.min, (Number(getCfg(item.key)) || 0) + dir * item.step)); applySetting(item.key, v); draw(); }
+}
+function drawSettings() {
+  setTitle('Settings');
+  const L = header();
+  L.push(lr(`  ${C.bold}Settings${C.reset}`, `${C.dim}${shortPath(CONFIG_FILE)}${C.reset}`));
+  L.push('');
+  S.setCursor = Math.min(Math.max(0, S.setCursor || 0), SETTINGS.length - 1);
+  SETTINGS.forEach((item, i) => {
+    const sel = i === S.setCursor;
+    const val = clip(settingValue(item), 34);
+    L.push(`  ${sel ? `${C.cyan}▸${C.reset}` : ' '} ${sel ? C.bold : C.dim}${item.label.padEnd(36)}${C.reset}${item.type === 'info' ? C.dim : ''}${val}${C.reset}`);
+  });
+  L.push('');
+  const cur = SETTINGS[S.setCursor];
+  const how = cur.type === 'text' ? 'Enter to edit' : cur.type === 'toggle' ? 'Enter or ←→ to toggle' : cur.type === 'cycle' ? '←→ to change' : cur.type === 'number' ? `←→ changes by ${cur.step}` : '';
+  L.push(`  ${C.dim}${how}${cur.hint ? ` · ${cur.hint}` : ''}${C.reset}`);
+  if (S.notice) L.push(`  ${C.green}${S.notice}${C.reset}`);
+  L.push('');
+  L.push(keys(['↑↓', 'select'], ['←→', 'change'], ['Enter', 'edit'], ['Esc', 'back']));
+  render(L);
+}
+
+// ---------------------------------------------------------------------------
+// Stats screen
+// ---------------------------------------------------------------------------
+function computeStats() {
+  const all = loadJson(HISTORY_FILE);
+  const ok = all.filter(h => h.success);
+  const now = Date.now(), day = 86400000;
+  const games = {};
+  for (const h of ok) {
+    const g = h.game || prettyTitle(h.title || '').game || 'Other';
+    const e = games[g] = games[g] || { n: 0, mb: 0 };
+    e.n++; e.mb += Number(h.sizeMB) || 0;
+  }
+  const totalMB = ok.reduce((a, h) => a + (Number(h.sizeMB) || 0), 0);
+  const secs = ok.reduce((a, h) => a + (Number(h.elapsed) || 0), 0);
+  return {
+    uploads: ok.length, failed: all.length - ok.length, totalMB,
+    avgMBps: secs > 0 ? totalMB / secs : 0,
+    week: ok.filter(h => now - parseTs(h) < 7 * day).length, month: ok.filter(h => now - parseTs(h) < 30 * day).length,
+    biggest: ok.reduce((m, h) => ((Number(h.sizeMB) || 0) > (Number(m && m.sizeMB) || 0) ? h : m), null),
+    games: Object.entries(games).sort((a, b) => b[1].n - a[1].n),
+    first: ok.length ? parseTs(ok[ok.length - 1]) : 0,
+  };
+}
+function drawStats() {
+  setTitle('Stats');
+  const st = computeStats();
+  const L = header();
+  L.push(lr(`  ${C.bold}Stats${C.reset}`, `${C.dim}${st.first ? 'since ' + new Date(st.first).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : ''}${C.reset}`));
+  L.push('');
+  L.push(lr(`  ${C.dim}Uploads${C.reset}        ${C.bold}${st.uploads}${C.reset}  ${C.dim}(${st.week} this week · ${st.month} this month${st.failed ? ` · ${st.failed} failed` : ''})${C.reset}`, ''));
+  L.push(lr(`  ${C.dim}Total size${C.reset}     ${fmtBytes(st.totalMB * 1048576)}`, `${C.dim}avg speed ${st.avgMBps.toFixed(1)} MB/s${C.reset}`));
+  if (st.biggest) L.push(`  ${C.dim}Biggest clip${C.reset}   ${clip(st.biggest.title, 36)} ${C.dim}(${fmtBytes((Number(st.biggest.sizeMB) || 0) * 1048576)})${C.reset}`);
+  L.push('');
+  L.push(rule('By game'));
+  if (!st.games.length) L.push(`  ${C.dim}No uploads yet.${C.reset}`);
+  const maxN = st.games.length ? st.games[0][1].n : 1;
+  for (const [g, e] of st.games.slice(0, 8)) {
+    const bar = `${C.cyan}${'▰'.repeat(Math.max(1, Math.round(12 * e.n / maxN)))}${C.dim}${'▱'.repeat(12 - Math.max(1, Math.round(12 * e.n / maxN)))}${C.reset}`;
+    L.push(lr(`  ${clip(g, 26).padEnd(26)} ${bar}  ${plural(e.n, 'clip')}`, `${C.dim}${fmtBytes(e.mb * 1048576)}${C.reset}`));
+  }
+  if (st.games.length > 8) L.push(`  ${C.dim}… and ${st.games.length - 8} more${C.reset}`);
+  if (S.notice) { L.push(''); L.push(`  ${C.green}${S.notice}${C.reset}`); }
+  L.push('');
+  L.push(keys(['E', 'export history.csv'], ['Esc', 'back']));
+  render(L);
+}
+function exportHistoryCsv() {
+  const out = path.join(SCRIPT_DIR, 'history.csv');
+  const q = v => `"${String(v == null ? '' : v).replace(/"/g, '""')}"`;
+  const rows = [['date', 'title', 'game', 'sizeMB', 'seconds', 'privacy', 'playlist', 'url', 'ok']];
+  for (const h of loadJson(HISTORY_FILE)) rows.push([h.date, h.title, h.game || '', h.sizeMB, h.elapsed, h.privacy, h.playlist, h.url, h.success ? 1 : 0]);
+  try { fs.writeFileSync(out, '\ufeff' + rows.map(r => r.map(q).join(',')).join('\r\n')); S.notice = `Exported ${rows.length - 1} rows to history.csv`; openFolder(SCRIPT_DIR); }
+  catch (e) { S.notice = `${C.red}Export failed: ${e.message}${C.reset}`; }
+  draw();
 }
 
 function drawHelp() {
@@ -780,7 +934,10 @@ function drawHelp() {
   L.push('');
   const rows = [
     ['Dashboard', [['C', 'copy last link'], ['O', 'open last clip'], ['L', 'open in YouTube Studio'], ['T', 'edit title'], ['P', 'cycle privacy']]],
-    ['', [['H', 'history'], ['F', 'open watch folder'], ['D', 'delete uploaded clips'], ['R', 'restart'], ['Q', 'minimize']]],
+    ['', [['H', 'history'], ['I', 'stats'], ['S', 'settings'], ['U', 'upload any file'], ['F', 'open watch folder'], ['D', 'delete uploaded clips']]],
+    ['', [['R', 'restart'], ['Q', 'hide to tray']]],
+    ['Settings', [['↑↓', 'select'], ['←→', 'change'], ['Enter', 'edit / toggle'], ['Esc', 'back']]],
+    ['Stats', [['E', 'export history.csv'], ['Esc', 'back']]],
     ['Uploading', [['T', 'title (applied at the end)'], ['P', 'privacy'], ['X', 'cancel'], ['S', 'skip next in queue']]],
     ['History', [['↑↓', 'select'], ['Enter', 'open'], ['C', 'copy link'], ['X', 'delete that file from disk']]],
     ['Errors', [['Enter', 'retry now'], ['A', 'sign in again'], ['Esc', 'give up on that clip']]],
@@ -935,9 +1092,16 @@ function drawEdit() {
   setTitle('Edit title');
   const L = header();
   const editingCurrent = S.editTarget === 'current' && S.current;
-  L.push(`  ${C.bold}Edit title${C.reset}   ${editingCurrent ? `${C.dim}applies when the upload finishes${C.reset}` : link(S.last.url)}`);
-  L.push('');
-  L.push(`  ${C.dim}Current:${C.reset} ${clip(editingCurrent ? S.current.title : S.last.title, 56)}`);
+  const settingItem = S.editTarget && S.editTarget.startsWith('setting:') ? SETTINGS.find(i => i.key === S.editTarget.slice(8)) : null;
+  if (settingItem) {
+    L.push(`  ${C.bold}Edit ${settingItem.label.toLowerCase()}${C.reset}   ${C.dim}${settingItem.hint || ''}${C.reset}`);
+    L.push('');
+    L.push(`  ${C.dim}Current:${C.reset} ${clip(settingValue(settingItem), 56)}`);
+  } else {
+    L.push(`  ${C.bold}Edit title${C.reset}   ${editingCurrent ? `${C.dim}applies when the upload finishes${C.reset}` : (S.last ? link(S.last.url) : '')}`);
+    L.push('');
+    L.push(`  ${C.dim}Current:${C.reset} ${clip(editingCurrent ? S.current.title : (S.last ? S.last.title : ''), 56)}`);
+  }
   L.push('');
   L.push(`  ${C.cyan}›${C.reset} ${S.editFresh ? `${C.inv}${S.editBuf}${C.noinv}` : S.editBuf}${C.cyan}_${C.reset}`);
   L.push('');
@@ -1211,6 +1375,9 @@ async function handleFile(filepath) {
       beepSuccess();
       if (CFG.showAfterUpload) showQuiet(); else flashTaskbar();
       toast('Uploaded · link copied', c.title, url);
+      { const t = uploadsToday(), lim = CFG.dailyUploadLimit;
+        if (t === lim - 1) toast('One upload left today', `${t} of ${lim} used · resets ${fmtClock(pacificMidnight(1))}`);
+        else if (t >= lim) toast('Daily upload limit reached', `Next clips wait until ${fmtClock(pacificMidnight(1))}`); }
       // If the user is mid-edit of this clip's title, keep the editor open but point it at the finished video.
       if (S.view === 'edit' && S.editTarget === 'current') { S.editTarget = 'last'; S.editReturn = 'done'; }
       else { S.view = 'done'; draw(); }
@@ -1425,7 +1592,8 @@ function handleKey(str, k = {}) {
       if (name === 'return') {
         const t = S.editBuf.trim().slice(0, 100);
         S.view = back;
-        if (S.editTarget === 'current' && S.current) { if (t) { S.current.title = t; S.notice = 'Title will be applied when the upload finishes'; } draw(); }
+        if (S.editTarget && S.editTarget.startsWith('setting:')) { applySetting(S.editTarget.slice(8), S.editBuf.trim()); draw(); }
+        else if (S.editTarget === 'current' && S.current) { if (t) { S.current.title = t; S.notice = 'Title will be applied when the upload finishes'; } draw(); }
         else if (t && t !== S.last.title) updateVideo({ title: t });
         else draw();
       }
@@ -1505,9 +1673,28 @@ function handleKey(str, k = {}) {
       else if (ch === 'q') goIdle(true);
       return;
 
+    case 'settings': {
+      const item = SETTINGS[S.setCursor] || SETTINGS[0];
+      if (name === 'up') { S.setCursor = Math.max(0, S.setCursor - 1); draw(); }
+      else if (name === 'down') { S.setCursor = Math.min(SETTINGS.length - 1, S.setCursor + 1); draw(); }
+      else if (name === 'left' || name === 'right' || name === 'return' || ch === ' ') stepSetting(item, name === 'left' ? -1 : 1, name === 'return');
+      else if (name === 'escape' || ch === 's') goIdle();
+      else if (ch === 'q') goIdle(true);
+      return;
+    }
+
+    case 'stats':
+      if (ch === 'e') exportHistoryCsv();
+      else if (name === 'escape' || ch === 'i') goIdle();
+      else if (ch === 'q') goIdle(true);
+      return;
+
     case 'idle': {
       const last = S.last || lastUpload();
       if (last && !S.last) S.last = last;
+      if (ch === 's') { S.notice = ''; S.setCursor = S.setCursor || 0; S.view = 'settings'; draw(); return; }
+      if (ch === 'i') { S.notice = ''; S.view = 'stats'; draw(); return; }
+      if (ch === 'u') { if (trayOn()) tray.send('pickfile'); else { S.notice = 'The file picker needs the tray helper (tray: true)'; draw(); } return; }
       if (ch === 'c' && last) { copyToClipboard(last.url); S.notice = 'Link copied'; draw(); }
       else if (ch === 'o' && last) openInBrowser(last.url);
       else if (ch === 'l' && last && last.videoId) openInBrowser(studioUrl(last.videoId));
@@ -1637,6 +1824,36 @@ function runCore() {
   watchConfig();
   setInterval(() => { if (IS_DAEMON && S.view === 'idle') publishState(); }, 30000);
   setInterval(() => { if (IS_DAEMON && S.view === 'waiting') publishState(); }, 1000);
+  // Sleep/wake: a 30s timer that suddenly sees minutes go by means the PC slept — rescan the folder.
+  let lastTick = Date.now();
+  setInterval(() => {
+    const now = Date.now();
+    if (now - lastTick > 120000) { log(`Resumed after ${fmtDuration((now - lastTick) / 1000)} asleep — rescanning the folder`); startWatcher(); checkDisk(); }
+    lastTick = now;
+  }, 30000);
+  checkDisk();
+  setInterval(checkDisk, 60 * 60 * 1000);
+}
+
+let lastDiskToast = 0;
+function checkDisk() {
+  if (!CFG.lowDiskGB) { S.lowDisk = null; return; }
+  try {
+    const st = fs.statfsSync(CFG.watchDir);
+    const freeGB = (st.bavail * st.bsize) / 1024 ** 3;
+    if (freeGB < CFG.lowDiskGB) {
+      const first = !S.lowDisk;
+      S.lowDisk = { freeGB };
+      if (first && Date.now() - lastDiskToast > 6 * 3600 * 1000) {
+        lastDiskToast = Date.now();
+        const od = uploadedOnDisk();
+        const size = od.reduce((a, e) => { try { return a + fs.statSync(e.path).size; } catch { return a; } }, 0);
+        toast('Low disk space', `${freeGB.toFixed(1)} GB free on the recording drive${od.length ? ` · press D in GameUploader to free ${fmtBytes(size)}` : ''}`);
+        log(`Low disk: ${freeGB.toFixed(1)} GB free`);
+      }
+    } else S.lowDisk = null;
+  } catch {}
+  if (S.view === 'idle') draw();
 }
 
 // Watch the folder. ignoreInitial:false also picks up clips dropped while the app was closed
