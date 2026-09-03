@@ -17,12 +17,20 @@ function ensureBuilt(dir, log = () => {}) {
     if (fs.existsSync(exe) && fs.statSync(exe).mtimeMs >= fs.statSync(src).mtimeMs) return exe;
   } catch {}
   if (!fs.existsSync(CSC)) { log('Tray: C# compiler not found, tray disabled'); return null; }
+  const ico = path.join(dir, 'icon.ico'), png = path.join(dir, 'icon.png'), stage = path.join(dir, 'tray-stage.exe');
+  const compile = (out, iconFile) => execFileSync(CSC, ['/nologo', '/target:winexe', '/optimize+', '/warn:0', `/out:${out}`, ...(iconFile ? [`/win32icon:${iconFile}`] : []), '/r:System.Windows.Forms.dll', '/r:System.Drawing.dll', src], { windowsHide: true, stdio: 'pipe', timeout: 60000 });
   try {
-    execFileSync(CSC, ['/nologo', '/target:winexe', '/optimize+', '/warn:0', `/out:${exe}`, '/r:System.Windows.Forms.dll', '/r:System.Drawing.dll', src], { windowsHide: true, stdio: 'pipe', timeout: 60000 });
-    log('Tray: helper compiled');
+    // Two stages: build once to render the icon artwork, then build the real helper with that icon embedded.
+    // The embedded icon is what Windows shows as the app identity (toast header, Start Menu shortcut).
+    compile(stage, null);
+    execFileSync(stage, ['--export-icon', png, ico], { windowsHide: true, stdio: 'pipe', timeout: 30000 });
+    compile(exe, ico);
+    try { fs.unlinkSync(stage); } catch {}
+    log('Tray: helper compiled (with embedded icon)');
     return exe;
   } catch (e) {
     log(`Tray: build failed: ${(e.stdout || e.stderr || e.message).toString().trim().slice(0, 400)}`);
+    try { fs.unlinkSync(stage); } catch {}
     return null;
   }
 }

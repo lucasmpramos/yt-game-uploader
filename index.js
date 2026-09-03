@@ -377,10 +377,17 @@ const studioUrl = videoId => `https://studio.youtube.com/video/${videoId}/edit`;
 // -install (vendored with node-notifier) creates it once.
 const START_MENU_LNK = path.join(process.env.APPDATA || '', 'Microsoft', 'Windows', 'Start Menu', 'Programs', `${WIN_TITLE}.lnk`);
 function ensureToastIdentity() {
-  if (!CFG.toast || !process.env.APPDATA || fs.existsSync(START_MENU_LNK)) return;
-  const exe = path.join(SCRIPT_DIR, 'node_modules', 'node-notifier', 'vendor', 'snoreToast', 'snoretoast-x64.exe');
-  if (!fs.existsSync(exe)) return;
-  try { execFile(exe, ['-install', WIN_TITLE, path.join(SCRIPT_DIR, 'start.bat'), WIN_TITLE], { windowsHide: true }, () => log('Registered toast identity (Start Menu shortcut)')); } catch {}
+  if (!CFG.toast || !process.env.APPDATA) return;
+  const snore = path.join(SCRIPT_DIR, 'node_modules', 'node-notifier', 'vendor', 'snoreToast', 'snoretoast-x64.exe');
+  const trayExe = path.join(SCRIPT_DIR, 'tray.exe');
+  if (!fs.existsSync(snore)) return;
+  // The shortcut's target supplies the app icon Windows shows in toast headers, so point it at tray.exe (which
+  // carries the icon) and refresh it whenever the helper is rebuilt.
+  const target = fs.existsSync(trayExe) ? trayExe : path.join(SCRIPT_DIR, 'start.bat');
+  try {
+    if (fs.existsSync(START_MENU_LNK) && (!fs.existsSync(trayExe) || fs.statSync(START_MENU_LNK).mtimeMs >= fs.statSync(trayExe).mtimeMs)) return;
+    execFile(snore, ['-install', WIN_TITLE, target, WIN_TITLE], { windowsHide: true }, () => log('Registered toast identity (Start Menu shortcut → tray.exe icon)'));
+  } catch {}
 }
 const xmlEsc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 function toast(title, message, url) {
@@ -589,7 +596,7 @@ function ensureWtProfile() {
         commandline: `node "${path.join(SCRIPT_DIR, 'index.js')}" --ui`,
         startingDirectory: SCRIPT_DIR,
         icon: path.join(SCRIPT_DIR, 'icon.png'),
-        tabColor: '#D4537E',
+        tabColor: '#000000',
         suppressApplicationTitle: false,
       }],
     };
@@ -611,7 +618,7 @@ function spawnUi() {
   const args = ['/c', 'start', '', 'wt.exe', '-w', WIN_TITLE];
   if (useProfile) args.push('-p', WIN_TITLE, '--title', WIN_TITLE);
   else {
-    args.push('-d', SCRIPT_DIR, '--title', WIN_TITLE, '--tabColor', '#D4537E', 'node', 'index.js', '--ui');
+    args.push('-d', SCRIPT_DIR, '--title', WIN_TITLE, '--tabColor', '#000000', 'node', 'index.js', '--ui');
     if (SIMULATE) args.push('--simulate');
     if (argValue('--config')) args.push('--config', argValue('--config'));
   }
@@ -1583,10 +1590,10 @@ function ensureIconAssets() {
 // Everything that makes the app tick (daemon and standalone modes): window helper, tray, watcher, config, clean-up.
 function runCore() {
   initWindowHelper();
-  ensureToastIdentity();
   log(`Watching: ${CFG.watchDir} (v${VERSION}, ${MODE})`);
   if (CFG.tray && !SIMULATE) tray = startTray({ dir: SCRIPT_DIR, title: WIN_TITLE, tooltip: `${WIN_TITLE} · starting`, onEvent: onTrayEvent, log });
   ensureIconAssets();
+  ensureToastIdentity();   // after the helper build: the shortcut takes its icon from tray.exe
   draw();
   autoClean();
   setInterval(autoClean, 60 * 60 * 1000);
