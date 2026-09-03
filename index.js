@@ -612,7 +612,7 @@ function startUiClient() {
       // Not running at all on first try → become the app ourselves (start.bat double-clicked without the daemon).
       if (retries === 0 && !uiEverConnected) { runStandaloneFallback(); return; }
       retries++;
-      setTimeout(connect, Math.min(5000, 500 * retries));
+      setTimeout(connect, Math.min(1000, 250 * retries));
     };
     let uiEverConnected = false;
     sock.once('connect', () => { uiEverConnected = true; });
@@ -1522,7 +1522,7 @@ async function main() {
     log(`Background process started (v${VERSION}) · pipe ${PIPE}`);
     runCore();
     // Open the UI window unless one (from before a restart) reconnects first.
-    setTimeout(() => { if (!uiAttached()) spawnUi(); }, 1500);
+    setTimeout(() => { if (!uiAttached()) spawnUi(); }, 3000);
     return;
   }
   process.title = WIN_TITLE;
