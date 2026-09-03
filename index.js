@@ -566,6 +566,7 @@ function startIpcServer(onAlreadyRunning) {
     sock.on('error', () => {});
     log(`UI window attached (${uiClients.size})`);
     publishState(sock);
+    setTimeout(() => { if (trayOn()) tray.send(`seticon ${path.join(SCRIPT_DIR, 'icon.ico')}`); }, 800);   // window exists by now
     if (!uiEverAttached) { uiEverAttached = true; setTimeout(() => { if (S.view === 'idle') hideSelf(); }, 2000); }
   });
   server.on('error', (e) => {
@@ -576,14 +577,50 @@ function startIpcServer(onAlreadyRunning) {
   return server;
 }
 
-// Opens the terminal UI in its own Windows Terminal window (or brings the existing one back).
+// Windows Terminal "fragment": registers a GameUploader profile (icon + pink tab) without touching the
+// user's settings.json. See https://learn.microsoft.com/windows/terminal/json-fragment-extensions
+const WT_FRAGMENT = path.join(process.env.LOCALAPPDATA || '', 'Microsoft', 'Windows Terminal', 'Fragments', WIN_TITLE, 'profile.json');
+function ensureWtProfile() {
+  if (!process.env.LOCALAPPDATA || SIMULATE) return false;
+  try {
+    const profile = {
+      profiles: [{
+        name: WIN_TITLE,
+        commandline: `node "${path.join(SCRIPT_DIR, 'index.js')}" --ui`,
+        startingDirectory: SCRIPT_DIR,
+        icon: path.join(SCRIPT_DIR, 'icon.png'),
+        tabColor: '#D4537E',
+        suppressApplicationTitle: false,
+      }],
+    };
+    const json = JSON.stringify(profile, null, 2);
+    if (fs.existsSync(WT_FRAGMENT) && fs.readFileSync(WT_FRAGMENT, 'utf8') === json) return true;
+    fs.mkdirSync(path.dirname(WT_FRAGMENT), { recursive: true });
+    fs.writeFileSync(WT_FRAGMENT, json);
+    log('Windows Terminal profile registered (fragment)');
+    return true;
+  } catch (e) { log(`WT profile registration failed: ${e.message}`); return false; }
+}
+
+// Opens the terminal UI in its own Windows Terminal window. Prefers the GameUploader profile (tab icon + color);
+// if Terminal doesn't know it yet (fragment just written, Terminal not restarted) falls back to the plain command.
+let spawnUiPlain = false;
 function spawnUi() {
   if (process.env.GAMEUPLOADER_NO_UI) return;
-  const args = ['/c', 'start', '', 'wt.exe', '-w', WIN_TITLE, '-d', SCRIPT_DIR, '--title', WIN_TITLE, 'node', 'index.js', '--ui'];
-  if (SIMULATE) args.push('--simulate');
-  if (argValue('--config')) args.push('--config', argValue('--config'));
-  try { spawn('cmd.exe', args, { detached: true, stdio: 'ignore', windowsHide: true }).unref(); log('Opening UI window'); }
-  catch (e) { log(`Could not open UI window: ${e.message}`); }
+  const useProfile = !spawnUiPlain && ensureWtProfile();
+  const args = ['/c', 'start', '', 'wt.exe', '-w', WIN_TITLE];
+  if (useProfile) args.push('-p', WIN_TITLE, '--title', WIN_TITLE);
+  else {
+    args.push('-d', SCRIPT_DIR, '--title', WIN_TITLE, '--tabColor', '#D4537E', 'node', 'index.js', '--ui');
+    if (SIMULATE) args.push('--simulate');
+    if (argValue('--config')) args.push('--config', argValue('--config'));
+  }
+  try { spawn('cmd.exe', args, { detached: true, stdio: 'ignore', windowsHide: true }).unref(); log(`Opening UI window${useProfile ? ' (profile)' : ''}`); }
+  catch (e) { log(`Could not open UI window: ${e.message}`); return; }
+  if (useProfile) {
+    const before = uiClients.size;
+    setTimeout(() => { if (uiClients.size <= before) { log('Profile launch did not attach — retrying with the plain command'); spawnUiPlain = true; spawnUi(); } }, 4000);
+  }
 }
 const uiAttached = () => uiClients.size > 0;
 

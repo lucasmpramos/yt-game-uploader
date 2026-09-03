@@ -37,7 +37,10 @@ class Tray : ApplicationContext
     [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
     [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
     [DllImport("user32.dll")] static extern bool AttachThreadInput(uint a, uint b, bool attach);
+    [DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr h, uint msg, IntPtr w, IntPtr l);
     delegate bool EnumProc(IntPtr h, IntPtr lp);
+    const uint WM_SETICON = 0x80;
+    readonly List<Icon> keepIcons = new List<Icon>();   // icons handed to other windows must stay alive
 
     const int SW_HIDE = 0, SW_SHOWNOACTIVATE = 4, SW_SHOW = 5, SW_MINIMIZE = 6, SW_RESTORE = 9;
     const uint SWP_NOSIZE = 1, SWP_NOMOVE = 2, SWP_NOACTIVATE = 0x10, SWP_SHOWWINDOW = 0x40;
@@ -343,6 +346,22 @@ class Tray : ApplicationContext
             case "minimize": { var h = FindWindow(); if (h != IntPtr.Zero) ShowWindow(h, SW_MINIMIZE); break; }
             case "toggle": { var h = FindWindow(); if (h != IntPtr.Zero) { if (IsWindowVisible(h) && !IsIconic(h)) ShowWindow(h, SW_HIDE); else Show(true); } break; }
             case "flash": { var h = FindWindow(); if (h != IntPtr.Zero) FlashWindow(h, true); break; }
+            case "seticon":
+            {   // seticon <path.ico>: stamp our icon onto the terminal window (title bar + taskbar)
+                var h = FindWindow();
+                if (h != IntPtr.Zero && File.Exists(arg))
+                {
+                    try
+                    {
+                        var big = new Icon(arg, 32, 32); var small = new Icon(arg, 16, 16);
+                        keepIcons.Add(big); keepIcons.Add(small);
+                        SendMessage(h, WM_SETICON, (IntPtr)1, big.Handle);
+                        SendMessage(h, WM_SETICON, (IntPtr)0, small.Handle);
+                    }
+                    catch { }
+                }
+                break;
+            }
             case "query": { var h = FindWindow(); Send("visible " + (h != IntPtr.Zero && IsWindowVisible(h) && !IsIconic(h) ? "1" : "0")); break; }
             case "quit": Exit(); break;
         }
